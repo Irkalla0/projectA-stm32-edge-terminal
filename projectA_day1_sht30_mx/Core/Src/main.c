@@ -32,6 +32,7 @@
 /* USER CODE BEGIN PTD */
 #define SHT30_ADDR_44 (0x44 << 1)
 #define SHT30_ADDR_45 (0x45 << 1)
+#define I2C_IO_TIMEOUT_MS 50U
 
 typedef enum
 {
@@ -521,12 +522,12 @@ static HAL_StatusTypeDef Sensor_Read(float *temp_c, float *hum_rh)
     uint8_t cmd[2] = {0x2C, 0x06};
     uint8_t rx[6];
 
-    if (HAL_I2C_Master_Transmit(g_sensor_i2c, g_sensor_addr, cmd, 2, HAL_MAX_DELAY) != HAL_OK)
+    if (HAL_I2C_Master_Transmit(g_sensor_i2c, g_sensor_addr, cmd, 2, I2C_IO_TIMEOUT_MS) != HAL_OK)
       return HAL_ERROR;
 
     HAL_Delay(20);
 
-    if (HAL_I2C_Master_Receive(g_sensor_i2c, g_sensor_addr, rx, 6, HAL_MAX_DELAY) != HAL_OK)
+    if (HAL_I2C_Master_Receive(g_sensor_i2c, g_sensor_addr, rx, 6, I2C_IO_TIMEOUT_MS) != HAL_OK)
       return HAL_ERROR;
 
     uint16_t raw_t = ((uint16_t)rx[0] << 8) | rx[1];
