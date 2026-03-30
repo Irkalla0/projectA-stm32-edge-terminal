@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import re
 import struct
@@ -15,6 +16,135 @@ import serial.tools.list_ports
 FRAME_HEX_RE = re.compile(r"FRAME_HEX:\s*([0-9A-Fa-f ]+)")
 SIM_LINE_RE = re.compile(r"(?:SIM\s+)?TEMP=([-+]?\d+(?:\.\d+)?)C\s+RH=([-+]?\d+(?:\.\d+)?)%")
 HEX_BYTE_RE = re.compile(r"\b[0-9A-Fa-f]{2}\b")
+PERIOD_RE = re.compile(r"^PERIOD:(\d+)$")
+THR_RE = re.compile(r"^THR:T=([-+]?\d+(?:\.\d+)?),H=([-+]?\d+(?:\.\d+)?)$")
+THR2_RE = re.compile(r"^THR2:D=(\d+),I=(\d+)$")
+SET_OK_PERIOD_RE = re.compile(r"^SET_PERIOD_OK:(\d+)$")
+SET_OK_T_RE = re.compile(r"^SET_THR_T_OK:([-+]?\d+(?:\.\d+)?)$")
+SET_OK_H_RE = re.compile(r"^SET_THR_H_OK:([-+]?\d+(?:\.\d+)?)$")
+SET_OK_D_RE = re.compile(r"^SET_THR_D_OK:(\d+)$")
+SET_OK_I_RE = re.compile(r"^SET_THR_I_OK:(\d+)$")
+
+DEFAULT_CFG = {
+    "period_ms": 500,
+    "thr_t": 26.5,
+    "thr_h": 60.0,
+    "thr_d": 900,
+    "thr_i": 800,
+}
+
+RANGES = {
+    "period_ms": (100, 5000),
+    "thr_t": (0.0, 80.0),
+    "thr_h": (0.0, 100.0),
+    "thr_d": (50, 4000),
+    "thr_i": (100, 5000),
+}
+
+
+def _clip_value(name: str, val):
+    lo, hi = RANGES[name]
+    if val < lo:
+        return lo
+    if val > hi:
+        return hi
+    return val
+
+
+def normalize_cfg(raw: dict):
+    cfg = dict(DEFAULT_CFG)
+    if not isinstance(raw, dict):
+        return cfg
+
+    for k in cfg.keys():
+        if k not in raw:
+            continue
+        try:
+            if k in ("period_ms", "thr_d", "thr_i"):
+                cfg[k] = int(raw[k])
+            else:
+                cfg[k] = float(raw[k])
+        except (ValueError, TypeError):
+            pass
+
+    for k in cfg.keys():
+        cfg[k] = _clip_value(k, cfg[k])
+    return cfg
+
+
+def load_cfg(path: str):
+    if not os.path.exists(path):
+        return dict(DEFAULT_CFG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return normalize_cfg(data)
+    except Exception as e:
+        print(f"[WARN] Config load failed: {e}. Use defaults.")
+        return dict(DEFAULT_CFG)
+
+
+def save_cfg(path: str, cfg: dict):
+    safe_cfg = normalize_cfg(cfg)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(safe_cfg, f, ensure_ascii=False, indent=2)
+    return safe_cfg
+
+
+def update_cfg_from_mcu_line(cfg: dict, line: str):
+    m = PERIOD_RE.match(line) or SET_OK_PERIOD_RE.match(line)
+    if m:
+        cfg["period_ms"] = _clip_value("period_ms", int(m.group(1)))
+        return
+
+    m = THR_RE.match(line)
+    if m:
+        cfg["thr_t"] = _clip_value("thr_t", float(m.group(1)))
+        cfg["thr_h"] = _clip_value("thr_h", float(m.group(2)))
+        return
+
+    m = THR2_RE.match(line)
+    if m:
+        cfg["thr_d"] = _clip_value("thr_d", int(m.group(1)))
+        cfg["thr_i"] = _clip_value("thr_i", int(m.group(2)))
+        return
+
+    m = SET_OK_T_RE.match(line)
+    if m:
+        cfg["thr_t"] = _clip_value("thr_t", float(m.group(1)))
+        return
+
+    m = SET_OK_H_RE.match(line)
+    if m:
+        cfg["thr_h"] = _clip_value("thr_h", float(m.group(1)))
+        return
+
+    m = SET_OK_D_RE.match(line)
+    if m:
+        cfg["thr_d"] = _clip_value("thr_d", int(m.group(1)))
+        return
+
+    m = SET_OK_I_RE.match(line)
+    if m:
+        cfg["thr_i"] = _clip_value("thr_i", int(m.group(1)))
+
+
+def update_cfg_from_tx_cmd(cfg: dict, cmd: str):
+    s = cmd.strip().upper()
+    try:
+        if s.startswith("SET_PERIOD"):
+            cfg["period_ms"] = _clip_value("period_ms", int(cmd.split()[-1]))
+        elif s.startswith("SET_THR_T"):
+            cfg["thr_t"] = _clip_value("thr_t", float(cmd.split()[-1]))
+        elif s.startswith("SET_THR_H"):
+            cfg["thr_h"] = _clip_value("thr_h", float(cmd.split()[-1]))
+        elif s.startswith("SET_THR_D"):
+            cfg["thr_d"] = _clip_value("thr_d", int(cmd.split()[-1]))
+        elif s.startswith("SET_THR_I"):
+            cfg["thr_i"] = _clip_value("thr_i", int(cmd.split()[-1]))
+    except Exception:
+        # Ignore parse failures; MCU reply parser is authoritative.
+        pass
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -144,13 +274,20 @@ def main():
     if args.set_period is not None and not (100 <= args.set_period <= 5000):
         parser.error("--set-period must be in range 100~5000")
 
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer_config.json")
+    current_cfg = load_cfg(cfg_path)
+    if args.set_period is not None:
+        current_cfg["period_ms"] = args.set_period
+    print(f"[INFO] Config loaded: {current_cfg}")
+    print(f"[INFO] Config path: {cfg_path}")
+
     tsq = deque(maxlen=args.points)
     tq = deque(maxlen=args.points)
     hq = deque(maxlen=args.points)
 
     plt.ion()
     fig, ax = plt.subplots()
-    fig.subplots_adjust(bottom=0.30)
+    fig.subplots_adjust(bottom=0.32)
     line_t, = ax.plot([], [], label="Temp(C)")
     line_h, = ax.plot([], [], label="RH(%)")
     ax.set_title("Project A UART Waveform")
@@ -166,9 +303,18 @@ def main():
     ser = None
     csv_fp = None
     csv_writer = None
+    auto_apply_on_open = True
+
+    def save_cfg_now():
+        nonlocal current_cfg
+        try:
+            current_cfg = save_cfg(cfg_path, current_cfg)
+            print(f"[INFO] Config saved: {current_cfg}")
+        except Exception as e:
+            print(f"[WARN] Config save failed: {e}")
 
     def send_cmd(cmd: str):
-        nonlocal ser, current_port
+        nonlocal ser, current_port, current_cfg
         cmd = cmd.strip()
         if not cmd:
             return
@@ -179,16 +325,28 @@ def main():
             ser.write((cmd + "\n").encode("ascii"))
             ser.flush()
             print(f"[TX] {cmd} ({current_port})")
+            update_cfg_from_tx_cmd(current_cfg, cmd)
         except serial.SerialException as e:
             print(f"[WARN] TX failed on {current_port}: {e}")
 
+    def apply_cfg_to_mcu():
+        send_cmd(f"SET_PERIOD {int(current_cfg['period_ms'])}")
+        send_cmd(f"SET_THR_T {float(current_cfg['thr_t']):.2f}")
+        send_cmd(f"SET_THR_H {float(current_cfg['thr_h']):.2f}")
+        send_cmd(f"SET_THR_D {int(current_cfg['thr_d'])}")
+        send_cmd(f"SET_THR_I {int(current_cfg['thr_i'])}")
+        send_cmd("GET_PERIOD")
+        send_cmd("GET_THR")
+        send_cmd("GET_THR2")
+
     # UI controls: click-to-send commands (no manual typing needed)
-    ax_b1 = fig.add_axes([0.06, 0.20, 0.12, 0.055])
-    ax_b2 = fig.add_axes([0.20, 0.20, 0.12, 0.055])
-    ax_b3 = fig.add_axes([0.34, 0.20, 0.12, 0.055])
-    ax_b4 = fig.add_axes([0.48, 0.20, 0.12, 0.055])
-    ax_b5 = fig.add_axes([0.62, 0.20, 0.14, 0.055])
-    ax_b6 = fig.add_axes([0.78, 0.20, 0.16, 0.055])
+    ax_b1 = fig.add_axes([0.04, 0.20, 0.12, 0.055])
+    ax_b2 = fig.add_axes([0.17, 0.20, 0.12, 0.055])
+    ax_b3 = fig.add_axes([0.30, 0.20, 0.12, 0.055])
+    ax_b4 = fig.add_axes([0.43, 0.20, 0.12, 0.055])
+    ax_b5 = fig.add_axes([0.56, 0.20, 0.12, 0.055])
+    ax_b6 = fig.add_axes([0.69, 0.20, 0.12, 0.055])
+    ax_b7 = fig.add_axes([0.82, 0.20, 0.14, 0.055])
     ax_tb = fig.add_axes([0.06, 0.11, 0.70, 0.055])
     ax_bs = fig.add_axes([0.78, 0.11, 0.16, 0.055])
 
@@ -198,6 +356,7 @@ def main():
     btn_get_thr2 = Button(ax_b4, "GET_THR2")
     btn_preset_a1 = Button(ax_b5, "A1_PRESET")
     btn_preset_a2 = Button(ax_b6, "A2_PRESET")
+    btn_save_cfg = Button(ax_b7, "SAVE_CFG")
     tb_cmd = TextBox(ax_tb, "CMD", initial="GET_PERIOD")
     btn_send = Button(ax_bs, "SEND")
 
@@ -223,6 +382,9 @@ def main():
         send_cmd("SET_THR_I 800")
         send_cmd("GET_THR2")
 
+    def on_save_cfg(_):
+        save_cfg_now()
+
     def on_send(_):
         send_cmd(tb_cmd.text)
 
@@ -232,6 +394,7 @@ def main():
     btn_get_thr2.on_clicked(on_get_thr2)
     btn_preset_a1.on_clicked(on_preset_a1)
     btn_preset_a2.on_clicked(on_preset_a2)
+    btn_save_cfg.on_clicked(on_save_cfg)
     btn_send.on_clicked(on_send)
     tb_cmd.on_submit(lambda text: send_cmd(text))
 
@@ -276,11 +439,9 @@ def main():
                     if ser is not None:
                         current_port = p
                         print(f"[INFO] Serial opened: {p} @ {args.baud}")
-                        if args.set_period is not None:
-                            tx_cmd = f"SET_PERIOD {args.set_period}\n"
-                            ser.write(tx_cmd.encode("ascii"))
-                            ser.flush()
-                            print(f"[TX] {tx_cmd.strip()}")
+                        if auto_apply_on_open:
+                            print("[INFO] Auto applying saved config to MCU...")
+                            apply_cfg_to_mcu()
                         break
 
                 if ser is None:
@@ -386,6 +547,7 @@ def main():
                         or line.startswith("THR2:")
                         or line.startswith("CMD_ERR:")
                     ):
+                        update_cfg_from_mcu_line(current_cfg, line)
                         print(f"[MCU] {line}")
                     elif args.raw:
                         print(f"RAW: {line}")
@@ -419,6 +581,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Exit")
     finally:
+        save_cfg_now()
         if ser is not None:
             ser.close()
         if csv_fp is not None:
