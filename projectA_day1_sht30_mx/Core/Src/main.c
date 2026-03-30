@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -56,6 +57,13 @@ I2C_HandleTypeDef hi2c2;
 
 UART_HandleTypeDef huart1;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
 static uint16_t g_sensor_addr = 0;
 static sensor_type_t g_sensor_type = SENSOR_NONE;
@@ -74,6 +82,7 @@ static uint16_t g_dist_alarm_th_mm = 600;
 static uint16_t g_curr_alarm_th_ma = 900;
 static char g_cmd_buf[64];
 static uint8_t g_cmd_len = 0;
+static uint32_t g_last_sample_tick = 0;
 
 /* USER CODE END PV */
 
@@ -83,6 +92,8 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_USART1_UART_Init(void);
+void StartDefaultTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 static void I2C_PrintScan(I2C_HandleTypeDef *hi2c, const char *bus_name);
 static void I2C_PrintScanAll(void);
@@ -93,6 +104,7 @@ static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum
 static void Protocol_ProcessCommand(const char *cmd);
 static void Protocol_HandleRxByte(uint8_t ch);
 static void Protocol_PollRx(void);
+static void App_TaskStep(void);
 
 /* USER CODE END PFP */
 
@@ -354,6 +366,65 @@ static void Protocol_PollRx(void)
     Protocol_HandleRxByte(ch);
 }
 
+static void App_TaskStep(void)
+{
+  uint32_t now = HAL_GetTick();
+  Protocol_PollRx();
+
+  if ((now - g_last_sample_tick) < g_sample_period_ms)
+    return;
+
+  g_last_sample_tick = now;
+
+  float t = 0.0f, h = 0.0f;
+  if (!g_sim_mode && Sensor_Read(&t, &h) == HAL_OK)
+  {
+    printf("TEMP=%.2fC RH=%.2f%% (type=%d bus=%s)\r\n", t, h, g_sensor_type, g_sensor_bus);
+  }
+  else
+  {
+    if (!g_sim_mode)
+    {
+      printf("SENSOR READ ERROR (bus=%s addr=%s), switch to SIM_MODE\r\n", g_sensor_bus, g_sensor_addr ? "ok" : "none");
+      g_sim_mode = 1;
+    }
+
+    g_sim_t += 0.15f;
+    if (g_sim_t > 30.0f) g_sim_t = 24.0f;
+    g_sim_h += 0.30f;
+    if (g_sim_h > 70.0f) g_sim_h = 45.0f;
+
+    t = g_sim_t;
+    h = g_sim_h;
+    printf("SIM TEMP=%.2fC RH=%.2f%%\r\n", t, h);
+  }
+
+  Protocol_PrintFrameHex(0x01, (int16_t)(t * 100.0f), (uint16_t)(h * 100.0f));
+
+  if (t >= g_temp_alarm_th_c || h >= g_hum_alarm_th_rh)
+  {
+    printf("ALARM %s%s T=%.2fC RH=%.2f%% (THR T=%.2f H=%.2f)\r\n",
+           (t >= g_temp_alarm_th_c) ? "T" : "",
+           (h >= g_hum_alarm_th_rh) ? "H" : "",
+           t, h, g_temp_alarm_th_c, g_hum_alarm_th_rh);
+    Protocol_PrintFrameHex(0xA1, (int16_t)(t * 100.0f), (uint16_t)(h * 100.0f));
+  }
+
+  g_sim_dist_mm = (g_sim_dist_mm > 120) ? (uint16_t)(g_sim_dist_mm - 35) : 1300;
+  g_sim_curr_ma = (g_sim_curr_ma < 1700) ? (uint16_t)(g_sim_curr_ma + 22) : 320;
+  printf("SIM2 DIST=%umm CUR=%umA\r\n", g_sim_dist_mm, g_sim_curr_ma);
+  Protocol_PrintFrameHex(0x02, (int16_t)g_sim_dist_mm, g_sim_curr_ma);
+
+  if (g_sim_dist_mm <= g_dist_alarm_th_mm || g_sim_curr_ma >= g_curr_alarm_th_ma)
+  {
+    printf("ALARM2 %s%s DIST=%umm CUR=%umA (THR D=%u I=%u)\r\n",
+           (g_sim_dist_mm <= g_dist_alarm_th_mm) ? "D" : "",
+           (g_sim_curr_ma >= g_curr_alarm_th_ma) ? "I" : "",
+           g_sim_dist_mm, g_sim_curr_ma, g_dist_alarm_th_mm, g_curr_alarm_th_ma);
+    Protocol_PrintFrameHex(0xA2, (int16_t)g_sim_dist_mm, g_sim_curr_ma);
+  }
+}
+
 static void I2C_PrintScan(I2C_HandleTypeDef *hi2c, const char *bus_name)
 {
   uint8_t found = 0;
@@ -505,74 +576,54 @@ int main(void)
   printf("CMD: GET_PERIOD / SET_PERIOD <100-5000>\r\n");
   printf("CMD: GET_THR / SET_THR_T <0-80> / SET_THR_H <0-100>\r\n");
   printf("CMD: GET_THR2 / SET_THR_D <50-4000> / SET_THR_I <100-5000>\r\n");
+  g_last_sample_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
 
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t last_sample_tick = HAL_GetTick();
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uint32_t now = HAL_GetTick();
-    Protocol_PollRx();
-
-    if ((now - last_sample_tick) >= g_sample_period_ms)
-    {
-      float t = 0.0f, h = 0.0f;
-      last_sample_tick = now;
-
-      if (!g_sim_mode && Sensor_Read(&t, &h) == HAL_OK)
-      {
-        printf("TEMP=%.2fC RH=%.2f%% (type=%d bus=%s)\r\n", t, h, g_sensor_type, g_sensor_bus);
-      }
-      else
-      {
-        if (!g_sim_mode)
-        {
-          printf("SENSOR READ ERROR (bus=%s addr=%s), switch to SIM_MODE\r\n", g_sensor_bus, g_sensor_addr ? "ok" : "none");
-          g_sim_mode = 1;
-        }
-
-        g_sim_t += 0.15f;
-        if (g_sim_t > 30.0f) g_sim_t = 24.0f;
-        g_sim_h += 0.30f;
-        if (g_sim_h > 70.0f) g_sim_h = 45.0f;
-
-        t = g_sim_t;
-        h = g_sim_h;
-        printf("SIM TEMP=%.2fC RH=%.2f%%\r\n", t, h);
-      }
-
-      Protocol_PrintFrameHex(0x01, (int16_t)(t * 100.0f), (uint16_t)(h * 100.0f));
-
-      if (t >= g_temp_alarm_th_c || h >= g_hum_alarm_th_rh)
-      {
-        printf("ALARM %s%s T=%.2fC RH=%.2f%% (THR T=%.2f H=%.2f)\r\n",
-               (t >= g_temp_alarm_th_c) ? "T" : "",
-               (h >= g_hum_alarm_th_rh) ? "H" : "",
-               t, h, g_temp_alarm_th_c, g_hum_alarm_th_rh);
-        Protocol_PrintFrameHex(0xA1, (int16_t)(t * 100.0f), (uint16_t)(h * 100.0f));
-      }
-
-      g_sim_dist_mm = (g_sim_dist_mm > 120) ? (uint16_t)(g_sim_dist_mm - 35) : 1300;
-      g_sim_curr_ma = (g_sim_curr_ma < 1700) ? (uint16_t)(g_sim_curr_ma + 22) : 320;
-      printf("SIM2 DIST=%umm CUR=%umA\r\n", g_sim_dist_mm, g_sim_curr_ma);
-      Protocol_PrintFrameHex(0x02, (int16_t)g_sim_dist_mm, g_sim_curr_ma);
-
-      if (g_sim_dist_mm <= g_dist_alarm_th_mm || g_sim_curr_ma >= g_curr_alarm_th_ma)
-      {
-        printf("ALARM2 %s%s DIST=%umm CUR=%umA (THR D=%u I=%u)\r\n",
-               (g_sim_dist_mm <= g_dist_alarm_th_mm) ? "D" : "",
-               (g_sim_curr_ma >= g_curr_alarm_th_ma) ? "I" : "",
-               g_sim_dist_mm, g_sim_curr_ma, g_dist_alarm_th_mm, g_curr_alarm_th_ma);
-        Protocol_PrintFrameHex(0xA2, (int16_t)g_sim_dist_mm, g_sim_curr_ma);
-      }
-    }
-
-    HAL_Delay(5);
+    HAL_Delay(1000);
   }
   /* USER CODE END 3 */
 }
@@ -731,8 +782,8 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -742,6 +793,47 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    App_TaskStep();
+    osDelay(5);
+  }
+  /* USER CODE END 5 */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
