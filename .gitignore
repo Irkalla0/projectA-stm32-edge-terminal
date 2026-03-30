@@ -15,6 +15,8 @@ projectA_day1_sht30_mx/Release/
 # Local backup artifacts
 thread_backup_*.zip
 thread_backup_*/
+chat_export_*.md
+thread_backup_automation_prompt.md
 
 # OS junk
 Thumbs.db
