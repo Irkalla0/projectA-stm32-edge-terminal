@@ -7,6 +7,7 @@ import time
 from collections import deque
 
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox
 import serial
 import serial.tools.list_ports
 
@@ -149,6 +150,7 @@ def main():
 
     plt.ion()
     fig, ax = plt.subplots()
+    fig.subplots_adjust(bottom=0.30)
     line_t, = ax.plot([], [], label="Temp(C)")
     line_h, = ax.plot([], [], label="RH(%)")
     ax.set_title("Project A UART Waveform")
@@ -164,6 +166,74 @@ def main():
     ser = None
     csv_fp = None
     csv_writer = None
+
+    def send_cmd(cmd: str):
+        nonlocal ser, current_port
+        cmd = cmd.strip()
+        if not cmd:
+            return
+        if ser is None:
+            print(f"[WARN] Serial not connected, command dropped: {cmd}")
+            return
+        try:
+            ser.write((cmd + "\n").encode("ascii"))
+            ser.flush()
+            print(f"[TX] {cmd} ({current_port})")
+        except serial.SerialException as e:
+            print(f"[WARN] TX failed on {current_port}: {e}")
+
+    # UI controls: click-to-send commands (no manual typing needed)
+    ax_b1 = fig.add_axes([0.06, 0.20, 0.12, 0.055])
+    ax_b2 = fig.add_axes([0.20, 0.20, 0.12, 0.055])
+    ax_b3 = fig.add_axes([0.34, 0.20, 0.12, 0.055])
+    ax_b4 = fig.add_axes([0.48, 0.20, 0.12, 0.055])
+    ax_b5 = fig.add_axes([0.62, 0.20, 0.14, 0.055])
+    ax_b6 = fig.add_axes([0.78, 0.20, 0.16, 0.055])
+    ax_tb = fig.add_axes([0.06, 0.11, 0.70, 0.055])
+    ax_bs = fig.add_axes([0.78, 0.11, 0.16, 0.055])
+
+    btn_get_period = Button(ax_b1, "GET_PERIOD")
+    btn_set_500 = Button(ax_b2, "SET_500")
+    btn_get_thr = Button(ax_b3, "GET_THR")
+    btn_get_thr2 = Button(ax_b4, "GET_THR2")
+    btn_preset_a1 = Button(ax_b5, "A1_PRESET")
+    btn_preset_a2 = Button(ax_b6, "A2_PRESET")
+    tb_cmd = TextBox(ax_tb, "CMD", initial="GET_PERIOD")
+    btn_send = Button(ax_bs, "SEND")
+
+    def on_get_period(_):
+        send_cmd("GET_PERIOD")
+
+    def on_set_500(_):
+        send_cmd("SET_PERIOD 500")
+
+    def on_get_thr(_):
+        send_cmd("GET_THR")
+
+    def on_get_thr2(_):
+        send_cmd("GET_THR2")
+
+    def on_preset_a1(_):
+        send_cmd("SET_THR_T 26.5")
+        send_cmd("SET_THR_H 60")
+        send_cmd("GET_THR")
+
+    def on_preset_a2(_):
+        send_cmd("SET_THR_D 900")
+        send_cmd("SET_THR_I 800")
+        send_cmd("GET_THR2")
+
+    def on_send(_):
+        send_cmd(tb_cmd.text)
+
+    btn_get_period.on_clicked(on_get_period)
+    btn_set_500.on_clicked(on_set_500)
+    btn_get_thr.on_clicked(on_get_thr)
+    btn_get_thr2.on_clicked(on_get_thr2)
+    btn_preset_a1.on_clicked(on_preset_a1)
+    btn_preset_a2.on_clicked(on_preset_a2)
+    btn_send.on_clicked(on_send)
+    tb_cmd.on_submit(lambda text: send_cmd(text))
 
     if args.csv:
         csv_path = os.path.abspath(args.csv)
@@ -311,6 +381,9 @@ def main():
                         line.startswith("SET_PERIOD_OK")
                         or line.startswith("SET_PERIOD_ERR")
                         or line.startswith("PERIOD:")
+                        or line.startswith("SET_THR_")
+                        or line.startswith("THR:")
+                        or line.startswith("THR2:")
                         or line.startswith("CMD_ERR:")
                     ):
                         print(f"[MCU] {line}")
