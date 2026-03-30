@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# STM32CubeIDE build outputs
+projectA_day1_sht30_mx/Debug/
+projectA_day1_sht30_mx/Release/
+
+# Optional generated artifacts
+*.elf
+*.map
+*.list
+*.hex
+
+# Local backup artifacts
+thread_backup_*.zip
+thread_backup_*/
+
+# OS junk
+Thumbs.db
+.DS_Store
