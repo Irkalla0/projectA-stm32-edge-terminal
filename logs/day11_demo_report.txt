@@ -1,0 +1,11 @@
+﻿=== Project A Demo Report ===
+CSV: D:\codex\project A\logs\day11_demo_run.csv
+Total frame: 763
+CRC pass: 763/763
+CMD count: {'1': 253, '2': 253, '162': 188, '161': 69}
+A1 alarm count(cmd=161): 69
+A2 alarm count(cmd=162): 188
+Temp C min/avg/max: 24.00/27.43/29.99
+RH % min/avg/max: 45.00/57.56/69.90
+Dist mm min/avg/max: 110.00/674.92/1300.00
+Curr mA min/avg/max: 320.00/1077.22/1714.00
