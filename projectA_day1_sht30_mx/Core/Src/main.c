@@ -65,6 +65,20 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+osThreadId_t sampleTaskHandle;
+const osThreadAttr_t sampleTask_attributes = {
+  .name = "sampleTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+osThreadId_t cmdTaskHandle;
+const osThreadAttr_t cmdTask_attributes = {
+  .name = "cmdTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
 static uint16_t g_sensor_addr = 0;
 static sensor_type_t g_sensor_type = SENSOR_NONE;
 static I2C_HandleTypeDef *g_sensor_i2c = NULL;
@@ -105,6 +119,8 @@ static void Protocol_ProcessCommand(const char *cmd);
 static void Protocol_HandleRxByte(uint8_t ch);
 static void Protocol_PollRx(void);
 static void App_TaskStep(void);
+void StartSampleTask(void *argument);
+void StartCmdTask(void *argument);
 
 /* USER CODE END PFP */
 
@@ -369,7 +385,6 @@ static void Protocol_PollRx(void)
 static void App_TaskStep(void)
 {
   uint32_t now = HAL_GetTick();
-  Protocol_PollRx();
 
   if ((now - g_last_sample_tick) < g_sample_period_ms)
     return;
@@ -604,7 +619,8 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  sampleTaskHandle = osThreadNew(StartSampleTask, NULL, &sampleTask_attributes);
+  cmdTaskHandle = osThreadNew(StartCmdTask, NULL, &cmdTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -791,6 +807,23 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void StartSampleTask(void *argument)
+{
+  for (;;)
+  {
+    App_TaskStep();
+    osDelay(5);
+  }
+}
+
+void StartCmdTask(void *argument)
+{
+  for (;;)
+  {
+    Protocol_PollRx();
+    osDelay(2);
+  }
+}
 
 /* USER CODE END 4 */
 
@@ -807,8 +840,7 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    App_TaskStep();
-    osDelay(5);
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }
