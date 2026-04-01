@@ -274,6 +274,16 @@ def main():
     if args.set_period is not None and not (100 <= args.set_period <= 5000):
         parser.error("--set-period must be in range 100~5000")
 
+    # Prefer common CJK fonts on Windows so Chinese labels render correctly.
+    plt.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+    plt.rcParams["axes.unicode_minus"] = False
+
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer_config.json")
     current_cfg = load_cfg(cfg_path)
     if args.set_period is not None:
@@ -288,13 +298,29 @@ def main():
     plt.ion()
     fig, ax = plt.subplots()
     fig.subplots_adjust(bottom=0.32)
-    line_t, = ax.plot([], [], label="Temp(C)")
-    line_h, = ax.plot([], [], label="RH(%)")
-    ax.set_title("Project A UART Waveform")
-    ax.set_xlabel("Time(s)")
-    ax.set_ylabel("Value")
+    line_t, = ax.plot([], [], label="温度(°C)")
+    line_h, = ax.plot([], [], label="湿度(%)")
+    ax.set_title("项目A 串口波形")
+    ax.set_xlabel("时间(s)")
+    ax.set_ylabel("数值")
     ax.grid(True)
     ax.legend()
+    status_text = fig.text(0.02, 0.97, "", fontsize=10, va="top", fontweight="bold")
+    status_msg = None
+    status_connected = None
+
+    def set_status(msg: str, connected: bool):
+        nonlocal status_msg, status_connected
+        if msg == status_msg and connected == status_connected:
+            return
+        status_msg = msg
+        status_connected = connected
+        color = "#0A7D33" if connected else "#B00020"
+        dot = "●"
+        status_text.set_text(f"{dot} 串口状态: {msg}")
+        status_text.set_color(color)
+
+    set_status("未连接（等待串口）", False)
 
     start = time.time()
     last_rx = 0.0
@@ -320,6 +346,7 @@ def main():
             return
         if ser is None:
             print(f"[WARN] Serial not connected, command dropped: {cmd}")
+            set_status("未连接，命令未发送", False)
             return
         try:
             ser.write((cmd + "\n").encode("ascii"))
@@ -328,6 +355,7 @@ def main():
             update_cfg_from_tx_cmd(current_cfg, cmd)
         except serial.SerialException as e:
             print(f"[WARN] TX failed on {current_port}: {e}")
+            set_status(f"发送失败（{current_port}）", False)
 
     def apply_cfg_to_mcu():
         send_cmd(f"SET_PERIOD {int(current_cfg['period_ms'])}")
@@ -350,15 +378,15 @@ def main():
     ax_tb = fig.add_axes([0.06, 0.11, 0.70, 0.055])
     ax_bs = fig.add_axes([0.78, 0.11, 0.16, 0.055])
 
-    btn_get_period = Button(ax_b1, "GET_PERIOD")
-    btn_set_500 = Button(ax_b2, "SET_500")
-    btn_get_thr = Button(ax_b3, "GET_THR")
-    btn_get_thr2 = Button(ax_b4, "GET_THR2")
-    btn_preset_a1 = Button(ax_b5, "A1_PRESET")
-    btn_preset_a2 = Button(ax_b6, "A2_PRESET")
-    btn_save_cfg = Button(ax_b7, "SAVE_CFG")
-    tb_cmd = TextBox(ax_tb, "CMD", initial="GET_PERIOD")
-    btn_send = Button(ax_bs, "SEND")
+    btn_get_period = Button(ax_b1, "读周期")
+    btn_set_500 = Button(ax_b2, "周期500ms")
+    btn_get_thr = Button(ax_b3, "读阈值A1")
+    btn_get_thr2 = Button(ax_b4, "读阈值A2")
+    btn_preset_a1 = Button(ax_b5, "A1预设")
+    btn_preset_a2 = Button(ax_b6, "A2预设")
+    btn_save_cfg = Button(ax_b7, "保存配置")
+    tb_cmd = TextBox(ax_tb, "命令", initial="GET_PERIOD")
+    btn_send = Button(ax_bs, "发送")
 
     def on_get_period(_):
         send_cmd("GET_PERIOD")
@@ -430,6 +458,7 @@ def main():
                 if not candidates:
                     if time.time() - last_warn > 3:
                         print("[WARN] No COM ports found.")
+                        set_status("未检测到串口", False)
                         last_warn = time.time()
                     time.sleep(0.2)
                     continue
@@ -439,6 +468,7 @@ def main():
                     if ser is not None:
                         current_port = p
                         print(f"[INFO] Serial opened: {p} @ {args.baud}")
+                        set_status(f"已连接 {p} @ {args.baud}", True)
                         if auto_apply_on_open:
                             print("[INFO] Auto applying saved config to MCU...")
                             apply_cfg_to_mcu()
@@ -447,6 +477,7 @@ def main():
                 if ser is None:
                     if time.time() - last_warn > 3:
                         print("[WARN] COM open failed, retrying...")
+                        set_status("串口打开失败，重试中", False)
                         last_warn = time.time()
                     time.sleep(0.2)
                     continue
@@ -456,6 +487,7 @@ def main():
                 line = ser.readline().decode("utf-8", errors="replace").strip()
             except serial.SerialException as e:
                 print(f"[WARN] Serial error on {current_port}: {e}")
+                set_status("连接断开，重连中", False)
                 try:
                     ser.close()
                 except Exception:
@@ -557,6 +589,7 @@ def main():
                         f"[WARN] No data on {current_port} for 3s. "
                         "Press RST once. If still no data, auto-switch port."
                     )
+                    set_status(f"{current_port} 3秒无数据，尝试切换", False)
                     last_warn = now
                     if args.port.lower() == "auto":
                         other = probe_other_port_with_data(current_port, args.baud)
@@ -569,6 +602,7 @@ def main():
                             if ser is not None:
                                 current_port = other
                                 print(f"[INFO] Switched to active port: {current_port}")
+                                set_status(f"已切换并连接 {current_port}", True)
 
             if tsq:
                 line_t.set_data(list(tsq), list(tq))
