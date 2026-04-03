@@ -102,3 +102,31 @@ py "D:\codex\project A\pc_tools\make_demo_report.py" "D:\codex\project A\logs\da
 - 接入真实 VL53L0X 替换模拟距离通道
 - 板级最终接线固定与稳定性长跑（连续 30 分钟+）
 - 最终演示录像与现场证据采集
+
+## 9. V2 升级基础设施（已落地）
+
+按《项目A_V2升级文档_新增硬件与软件清单.docx》，当前仓库已先落地第一批可执行基础设施：
+
+- 升级协议草案文档：`docs/protocol/v2_upgrade_uart_protocol.md`
+- 固件导出脚本：`tools/make_app_bin.py`
+- 固件打包/校验脚本：`tools/pack_fw.py`
+- 串口升级脚本：`pc_tools/uart_upgrade_client.py`
+- V2 目录骨架：`bootloader/`、`app/`、`tools/`
+- 固件命令能力扩展：`GET_VER / GET_CAP / UPG_*`（保持 V1 `GET_/SET_` 兼容）
+
+推荐执行顺序：
+
+1. 编译 `projectA_day1_sht30_mx` 得到最新 `elf`
+2. 运行 `tools/make_app_bin.py` 导出 `build/v2/app.bin`
+3. 运行 `tools/pack_fw.py pack` 生成 `app_with_header.bin` 与 `upgrade_package.bin`
+4. 运行 `tools/pack_fw.py inspect --strict` 做离线完整性检查
+5. 运行 `pc_tools/uart_upgrade_client.py` 走 UART 升级闭环
+
+## 10. 下一阶段（按最小风险）
+
+1. 固件新增 `GET_VER` / `GET_CAP`（保持 V1 协议兼容）
+2. 在不破坏现有采样路径下，新增 UART 升级状态机命令：
+   - `UPG_BEGIN / UPG_DATA / UPG_END / UPG_STATUS / UPG_ABORT`
+3. 上位机新增“升级页”并复用现有串口链路
+4. 完成异常用例：断电、错包、CRC 错、非法版本
+5. 第二阶段再做外部 SPI Flash 回滚与 CAN 升级链路

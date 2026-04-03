@@ -24,6 +24,9 @@ SET_OK_T_RE = re.compile(r"^SET_THR_T_OK:([-+]?\d+(?:\.\d+)?)$")
 SET_OK_H_RE = re.compile(r"^SET_THR_H_OK:([-+]?\d+(?:\.\d+)?)$")
 SET_OK_D_RE = re.compile(r"^SET_THR_D_OK:(\d+)$")
 SET_OK_I_RE = re.compile(r"^SET_THR_I_OK:(\d+)$")
+VER_RE = re.compile(r"^VER:app=([^,]+),boot=(.+)$")
+CAP_RE = re.compile(r"^CAP:upgrade_uart=(\d+),max_chunk=(\d+),dual_slot=(\d+)$")
+UPG_STATUS_RE = re.compile(r"^UPG_STATUS:([^,]+),off=(\d+),err=(.+)$")
 
 DEFAULT_CFG = {
     "period_ms": 500,
@@ -367,6 +370,9 @@ def main():
         send_cmd("GET_PERIOD")
         send_cmd("GET_THR")
         send_cmd("GET_THR2")
+        send_cmd("GET_VER")
+        send_cmd("GET_CAP")
+        send_cmd("UPG_STATUS")
 
     # UI controls: click-to-send commands (no manual typing needed)
     ax_b1 = fig.add_axes([0.04, 0.20, 0.12, 0.055])
@@ -578,10 +584,31 @@ def main():
                         or line.startswith("SET_THR_")
                         or line.startswith("THR:")
                         or line.startswith("THR2:")
+                        or line.startswith("VER:")
+                        or line.startswith("CAP:")
+                        or line.startswith("UPG_STATUS:")
+                        or line.startswith("UPG_ACK ")
+                        or line.startswith("UPG_NACK ")
                         or line.startswith("CMD_ERR:")
                     ):
                         update_cfg_from_mcu_line(current_cfg, line)
-                        print(f"[MCU] {line}")
+                        m_ver = VER_RE.match(line)
+                        m_cap = CAP_RE.match(line)
+                        m_upg = UPG_STATUS_RE.match(line)
+                        if m_ver:
+                            print(f"[MCU] {line} (app={m_ver.group(1)} boot={m_ver.group(2)})")
+                        elif m_cap:
+                            print(
+                                f"[MCU] {line} "
+                                f"(upgrade_uart={m_cap.group(1)} max_chunk={m_cap.group(2)} dual_slot={m_cap.group(3)})"
+                            )
+                        elif m_upg:
+                            print(
+                                f"[MCU] {line} "
+                                f"(state={m_upg.group(1)} off={m_upg.group(2)} err={m_upg.group(3)})"
+                            )
+                        else:
+                            print(f"[MCU] {line}")
                     elif args.raw:
                         print(f"RAW: {line}")
             else:

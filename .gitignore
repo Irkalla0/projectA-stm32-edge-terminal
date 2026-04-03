@@ -11,6 +11,8 @@ projectA_day1_sht30_mx/Release/
 *.map
 *.list
 *.hex
+# Upgrade build artifacts
+build/
 
 # Local backup artifacts
 thread_backup_*.zip

@@ -40,10 +40,27 @@ typedef enum
   SENSOR_SHT3X
 } sensor_type_t;
 
+typedef enum
+{
+  UPG_STATE_IDLE = 0,
+  UPG_STATE_RECEIVING,
+  UPG_STATE_RECEIVED,
+  UPG_STATE_ACTIVATING,
+  UPG_STATE_PENDING_CONFIRM,
+  UPG_STATE_CONFIRMED,
+  UPG_STATE_ROLLBACK_REQUIRED,
+  UPG_STATE_ERROR
+} upgrade_state_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define APP_VERSION_STR "1.5.0"
+#define BOOT_VERSION_STR "0.1.0"
+#define UPG_MAX_CHUNK_BYTES 128U
+#define UPG_CMD_BUF_SIZE 384U
+#define UPG_MAX_IMAGE_BYTES (1024U * 1024U)
 
 /* USER CODE END PD */
 
@@ -96,9 +113,15 @@ static float g_temp_alarm_th_c = 28.5f;
 static float g_hum_alarm_th_rh = 68.0f;
 static uint16_t g_dist_alarm_th_mm = 600;
 static uint16_t g_curr_alarm_th_ma = 900;
-static char g_cmd_buf[64];
-static uint8_t g_cmd_len = 0;
+static char g_cmd_buf[UPG_CMD_BUF_SIZE];
+static uint16_t g_cmd_len = 0;
 static uint32_t g_last_sample_tick = 0;
+static upgrade_state_t g_upg_state = UPG_STATE_IDLE;
+static uint32_t g_upg_expected_size = 0;
+static uint32_t g_upg_expected_crc32 = 0;
+static uint32_t g_upg_received = 0;
+static uint32_t g_upg_running_crc32 = 0xFFFFFFFFU;
+static char g_upg_last_err[16] = "OK";
 
 /* USER CODE END PV */
 
@@ -117,11 +140,17 @@ static void I2C_PrintScanAll(void);
 static void Sensor_Detect(void);
 static HAL_StatusTypeDef Sensor_Read(float *temp_c, float *hum_rh);
 static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len);
+static uint32_t CRC32_UpdateRaw(uint32_t crc, const uint8_t *data, uint16_t len);
 static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum_centi);
 static void Protocol_ProcessCommand(const char *cmd);
 static void Protocol_HandleRxByte(uint8_t ch);
 static void Protocol_PollRx(void);
 static void App_TaskStep(void);
+static int ParseU32Token(const char *text, uint32_t *out);
+static int ParseHexBytes(const char *hex, uint8_t *out, uint16_t max_len, uint16_t *out_len);
+static const char *Upg_StateName(upgrade_state_t state);
+static void Upg_SetErr(const char *err);
+static void Upg_ResetSession(void);
 void StartSampleTask(void *argument);
 void StartCmdTask(void *argument);
 
@@ -151,6 +180,109 @@ static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len)
     }
   }
   return crc;
+}
+
+static uint32_t CRC32_UpdateRaw(uint32_t crc, const uint8_t *data, uint16_t len)
+{
+  for (uint16_t i = 0; i < len; i++)
+  {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++)
+    {
+      if (crc & 1U)
+        crc = (crc >> 1) ^ 0xEDB88320U;
+      else
+        crc >>= 1;
+    }
+  }
+  return crc;
+}
+
+static int ParseU32Token(const char *text, uint32_t *out)
+{
+  char *endptr = NULL;
+  unsigned long value = strtoul(text, &endptr, 0);
+  if (text[0] == '-' || text == endptr || (endptr && *endptr != '\0') || value > 0xFFFFFFFFUL)
+    return 0;
+  *out = (uint32_t)value;
+  return 1;
+}
+
+static int HexNibble(char ch)
+{
+  if (ch >= '0' && ch <= '9')
+    return ch - '0';
+  if (ch >= 'A' && ch <= 'F')
+    return ch - 'A' + 10;
+  if (ch >= 'a' && ch <= 'f')
+    return ch - 'a' + 10;
+  return -1;
+}
+
+static int ParseHexBytes(const char *hex, uint8_t *out, uint16_t max_len, uint16_t *out_len)
+{
+  uint16_t hex_len = (uint16_t)strlen(hex);
+  if (hex_len == 0 || (hex_len % 2U) != 0U)
+    return -1;
+  if ((hex_len / 2U) > max_len)
+    return -1;
+
+  for (uint16_t i = 0; i < (hex_len / 2U); i++)
+  {
+    int hi = HexNibble(hex[2U * i]);
+    int lo = HexNibble(hex[2U * i + 1U]);
+    if (hi < 0 || lo < 0)
+      return -1;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+
+  *out_len = (uint16_t)(hex_len / 2U);
+  return 0;
+}
+
+static const char *Upg_StateName(upgrade_state_t state)
+{
+  switch (state)
+  {
+  case UPG_STATE_IDLE:
+    return "idle";
+  case UPG_STATE_RECEIVING:
+    return "receiving";
+  case UPG_STATE_RECEIVED:
+    return "received";
+  case UPG_STATE_ACTIVATING:
+    return "activating";
+  case UPG_STATE_PENDING_CONFIRM:
+    return "pending_confirm";
+  case UPG_STATE_CONFIRMED:
+    return "confirmed";
+  case UPG_STATE_ROLLBACK_REQUIRED:
+    return "rollback_required";
+  case UPG_STATE_ERROR:
+    return "error";
+  default:
+    return "unknown";
+  }
+}
+
+static void Upg_SetErr(const char *err)
+{
+  size_t n = strlen(err);
+  if (n >= sizeof(g_upg_last_err))
+    n = sizeof(g_upg_last_err) - 1U;
+  memcpy(g_upg_last_err, err, n);
+  g_upg_last_err[n] = '\0';
+  g_upg_state = UPG_STATE_ERROR;
+}
+
+static void Upg_ResetSession(void)
+{
+  g_upg_state = UPG_STATE_IDLE;
+  g_upg_expected_size = 0;
+  g_upg_expected_crc32 = 0;
+  g_upg_received = 0;
+  g_upg_running_crc32 = 0xFFFFFFFFU;
+  memcpy(g_upg_last_err, "OK", 3U);
 }
 
 static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum_centi)
@@ -189,7 +321,7 @@ static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum
 
 static void Protocol_ProcessCommand(const char *cmd)
 {
-  char cmd_trim[64];
+  char cmd_trim[UPG_CMD_BUF_SIZE];
   size_t len = strlen(cmd);
   size_t start = 0;
   size_t end = len;
@@ -349,6 +481,185 @@ static void Protocol_ProcessCommand(const char *cmd)
   if (strcmp(cmd_trim, "GET_THR2") == 0)
   {
     printf("THR2:D=%u,I=%u\r\n", g_dist_alarm_th_mm, g_curr_alarm_th_ma);
+    return;
+  }
+
+  if (strcmp(cmd_trim, "GET_VER") == 0)
+  {
+    printf("VER:app=%s,boot=%s\r\n", APP_VERSION_STR, BOOT_VERSION_STR);
+    return;
+  }
+
+  if (strcmp(cmd_trim, "GET_CAP") == 0)
+  {
+    printf("CAP:upgrade_uart=1,max_chunk=%u,dual_slot=0\r\n", (unsigned int)UPG_MAX_CHUNK_BYTES);
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_STATUS") == 0)
+  {
+    printf("UPG_STATUS:%s,off=%lu,err=%s\r\n", Upg_StateName(g_upg_state), (unsigned long)g_upg_received, g_upg_last_err);
+    return;
+  }
+
+  if (strncmp(cmd_trim, "UPG_BEGIN", 9) == 0)
+  {
+    char ver[16] = {0};
+    char size_token[32] = {0};
+    char crc_token[32] = {0};
+    uint32_t size = 0;
+    uint32_t image_crc = 0;
+    if (sscanf(cmd_trim, "UPG_BEGIN %15s %31s %31s", ver, size_token, crc_token) != 3)
+    {
+      Upg_SetErr("E_ARG");
+      printf("UPG_NACK BEGIN E_ARG\r\n");
+      return;
+    }
+    if (!ParseU32Token(size_token, &size) || !ParseU32Token(crc_token, &image_crc) || size == 0U || size > UPG_MAX_IMAGE_BYTES)
+    {
+      Upg_SetErr("E_ARG");
+      printf("UPG_NACK BEGIN E_ARG\r\n");
+      return;
+    }
+
+    g_upg_expected_size = size;
+    g_upg_expected_crc32 = image_crc;
+    g_upg_received = 0;
+    g_upg_running_crc32 = 0xFFFFFFFFU;
+    g_upg_state = UPG_STATE_RECEIVING;
+    memcpy(g_upg_last_err, "OK", 3U);
+    printf("UPG_ACK BEGIN off=0\r\n");
+    return;
+  }
+
+  if (strncmp(cmd_trim, "UPG_DATA", 8) == 0)
+  {
+    char off_token[32] = {0};
+    char payload_hex[(UPG_MAX_CHUNK_BYTES * 2U) + 1U] = {0};
+    char crc_token[32] = {0};
+    uint8_t chunk[UPG_MAX_CHUNK_BYTES];
+    uint16_t chunk_len = 0;
+    uint32_t offset = 0;
+    uint32_t chunk_crc = 0;
+    uint32_t calc_chunk_crc = 0;
+
+    if (g_upg_state != UPG_STATE_RECEIVING)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK DATA E_STATE\r\n");
+      return;
+    }
+
+    if (sscanf(cmd_trim, "UPG_DATA %31s %256s %31s", off_token, payload_hex, crc_token) != 3)
+    {
+      Upg_SetErr("E_ARG");
+      printf("UPG_NACK DATA E_ARG\r\n");
+      return;
+    }
+
+    if (!ParseU32Token(off_token, &offset) || !ParseU32Token(crc_token, &chunk_crc))
+    {
+      Upg_SetErr("E_ARG");
+      printf("UPG_NACK DATA E_ARG\r\n");
+      return;
+    }
+
+    if (offset != g_upg_received)
+    {
+      Upg_SetErr("E_OFF");
+      printf("UPG_NACK DATA E_OFF\r\n");
+      return;
+    }
+
+    if (ParseHexBytes(payload_hex, chunk, UPG_MAX_CHUNK_BYTES, &chunk_len) != 0)
+    {
+      Upg_SetErr("E_ARG");
+      printf("UPG_NACK DATA E_ARG\r\n");
+      return;
+    }
+
+    if ((g_upg_received + chunk_len) > g_upg_expected_size)
+    {
+      Upg_SetErr("E_OFF");
+      printf("UPG_NACK DATA E_OFF\r\n");
+      return;
+    }
+
+    calc_chunk_crc = CRC32_UpdateRaw(0xFFFFFFFFU, chunk, chunk_len) ^ 0xFFFFFFFFU;
+    if (calc_chunk_crc != chunk_crc)
+    {
+      Upg_SetErr("E_CRC_CHUNK");
+      printf("UPG_NACK DATA E_CRC_CHUNK\r\n");
+      return;
+    }
+
+    g_upg_running_crc32 = CRC32_UpdateRaw(g_upg_running_crc32, chunk, chunk_len);
+    g_upg_received += chunk_len;
+    memcpy(g_upg_last_err, "OK", 3U);
+    printf("UPG_ACK DATA off=%lu\r\n", (unsigned long)g_upg_received);
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_END") == 0)
+  {
+    uint32_t image_crc = 0;
+    if (g_upg_state != UPG_STATE_RECEIVING)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK END E_STATE\r\n");
+      return;
+    }
+    if (g_upg_received != g_upg_expected_size)
+    {
+      Upg_SetErr("E_OFF");
+      printf("UPG_NACK END E_OFF\r\n");
+      return;
+    }
+    image_crc = g_upg_running_crc32 ^ 0xFFFFFFFFU;
+    if (image_crc != g_upg_expected_crc32)
+    {
+      Upg_SetErr("E_CRC_IMAGE");
+      printf("UPG_NACK END E_CRC_IMAGE\r\n");
+      return;
+    }
+    g_upg_state = UPG_STATE_RECEIVED;
+    memcpy(g_upg_last_err, "OK", 3U);
+    printf("UPG_ACK END\r\n");
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_ACTIVATE") == 0)
+  {
+    if (g_upg_state != UPG_STATE_RECEIVED)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK ACTIVATE E_STATE\r\n");
+      return;
+    }
+    g_upg_state = UPG_STATE_PENDING_CONFIRM;
+    memcpy(g_upg_last_err, "OK", 3U);
+    printf("UPG_ACK ACTIVATE\r\n");
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_CONFIRM") == 0)
+  {
+    if (g_upg_state != UPG_STATE_PENDING_CONFIRM)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK CONFIRM E_STATE\r\n");
+      return;
+    }
+    g_upg_state = UPG_STATE_CONFIRMED;
+    memcpy(g_upg_last_err, "OK", 3U);
+    printf("UPG_ACK CONFIRM\r\n");
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_ABORT") == 0)
+  {
+    Upg_ResetSession();
+    printf("UPG_ACK ABORT\r\n");
     return;
   }
 
@@ -598,6 +909,10 @@ int main(void)
   printf("CMD: GET_PERIOD / SET_PERIOD <100-5000>\r\n");
   printf("CMD: GET_THR / SET_THR_T <0-80> / SET_THR_H <0-100>\r\n");
   printf("CMD: GET_THR2 / SET_THR_D <50-4000> / SET_THR_I <100-5000>\r\n");
+  printf("CMD: GET_VER / GET_CAP / UPG_STATUS / UPG_ABORT\r\n");
+  printf("CMD: UPG_BEGIN <ver> <size> <crc32> / UPG_DATA <off> <hex> <crc32>\r\n");
+  printf("CMD: UPG_END / UPG_ACTIVATE / UPG_CONFIRM\r\n");
+  Upg_ResetSession();
   g_last_sample_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
