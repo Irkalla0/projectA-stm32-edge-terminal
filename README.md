@@ -1,55 +1,23 @@
 # Project A - STM32F407 多传感器边缘采集与异常告警终端
 
-本仓库是 `项目A` 的实战开发记录，面向从 0 开始的嵌入式学习与演示交付。  
-当前已完成：UART 协议、温湿度采集/模拟、双通道告警、上位机波形与参数配置、配置持久化。
+`项目A` 的实战开发仓库（从 0 到可演示版本）。当前代码以“先跑通端到端，再替换真实传感器”为策略推进。
 
-## 1. 项目目标
+## 1. 当前状态（2026-04-03）
 
-- 主控：`STM32F407ZGT6`
-- 串口通信：`USART1 @ 115200`
-- 协议要求：帧头、命令字、长度、序号、时间戳、CRC16
-- 上位机：实时波形 + 参数下发 + CSV 记录
-- 告警：至少两类（当前实现 A1 温湿度、A2 距离/电流）
+- 固件已支持双告警链路：
+  - `CMD=0x01/0xA1` 温湿度数据/告警
+  - `CMD=0x02/0xA2` 距离电流数据/告警（当前可用模拟通道）
+- 上位机已完成：中文 UI、连接状态提示、配置持久化、CSV 落盘
+- 串口容错已增强：固件同时支持 `USART1(PA9/PA10)` 与 `USART2(PA2/PA3)`
+- 日志与报告链路可用：`logs/*.csv` + `pc_tools/make_demo_report.py`
 
-## 2. 已实现功能（截至 Day13）
+## 2. 快速启动
 
-- `CMD=0x01`：温湿度数据帧
-- `CMD=0xA1`：温湿度告警帧
-- `CMD=0x02`：距离/电流数据帧（当前为模拟通道）
-- `CMD=0xA2`：距离/电流告警帧（当前为模拟通道）
-- 参数命令：
-  - `SET_PERIOD / GET_PERIOD`
-  - `SET_THR_T / SET_THR_H / GET_THR`
-  - `SET_THR_D / SET_THR_I / GET_THR2`
-- 上位机工具：
-  - 自动识别串口
-  - 波形显示与告警帧打印
-  - CSV 落盘
-  - 按钮配置（GET/SET/PRESET）
-  - 配置持久化（`viewer_config.json` 自动保存与自动下发）
+### 2.1 编译固件
 
-## 3. 仓库结构
+使用 STM32CubeIDE 编译，或在 PowerShell 使用 GNU Toolchain + make（仓库已含 Debug makefile）。
 
-```text
-project A/
-├─ projectA_day1_sht30_mx/      # STM32CubeIDE 工程
-├─ pc_tools/
-│  ├─ uart_frame_viewer.py      # 上位机波形与命令工具
-│  └─ find_uart_port.py         # 串口辅助探测脚本
-├─ logs/                        # 实验记录与 CSV 证据
-└─ README.md
-```
-
-## 4. 本地开发环境
-
-- Windows 11
-- STM32CubeIDE 2.1.1
-- Python 3.x
-- OpenOCD（使用 CubeIDE 自带）
-
-## 5. 烧录步骤（CMSIS-DAP / Mini HSDAP）
-
-先在 CubeIDE 编译生成 `elf`，然后在 PowerShell 执行：
+### 2.2 烧录固件（CMSIS-DAP）
 
 ```powershell
 & "D:\stm32cubelde\STM32CubeIDE_2.1.1\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.openocd.win32_2.4.400.202601091506\tools\bin\openocd.exe" `
@@ -61,48 +29,76 @@ project A/
   -c "program {D:/codex/project A/projectA_day1_sht30_mx/Debug/projectA_day1_sht30_mx.elf} verify reset exit"
 ```
 
-成功标志：
+若用 ST-LINK，把 `interface/cmsis-dap.cfg` 改成 `interface/stlink.cfg`。
 
-- `** Programming Finished **`
-- `** Verified OK **`
-
-## 6. 上位机运行
+### 2.3 启动上位机
 
 ```powershell
 py "D:\codex\project A\pc_tools\uart_frame_viewer.py" --port auto --baud 115200 --csv "D:\codex\project A\logs\run.csv"
 ```
 
-可选参数：
+## 3. 串口接线建议
 
-- `--set-period 500`：启动后设置采样周期
-- `--points 180`：波形显示点数
-- `--raw`：打印未识别原始行
+推荐先用 `USART2`：
 
-## 7. 常用串口命令
+- `PA2` = TX（接 CH340 RXD）
+- `PA3` = RX（接 CH340 TXD）
+- `GND` 必须共地
+
+备份口 `USART1`：
+
+- `PA9` = TX（接 CH340 RXD）
+- `PA10` = RX（接 CH340 TXD）
+
+> 固件双串口都能收发，优先保证先看到日志，再接命令回路。
+
+## 4. 排障手册（No data on COMx）
+
+1. 先排除端口占用：不要同时开 `miniterm` 和 `uart_frame_viewer.py`
+2. 单向监听法：只接 `TX + GND`，按 `RST` 看是否有 `BOOT_ / SIM / FRAME_HEX`
+3. 端口探测脚本：
+
+```powershell
+py "D:\codex\project A\pc_tools\find_uart_port.py" --baud 115200 --duration 25
+```
+
+4. 若脚本提示 `noise_like` 高，通常是 RX 悬空/线序错/共地问题
+
+## 5. 常用命令
 
 ```text
 GET_PERIOD
 SET_PERIOD 500
-
 GET_THR
 SET_THR_T 26.5
 SET_THR_H 60
-
 GET_THR2
 SET_THR_D 900
 SET_THR_I 800
 ```
 
-## 8. Git 历史里程碑
+## 6. 日志与报告
 
-- `8439492`：Day1-Day10 基础功能与协议/工具整合
-- `05b1828`：仓库清理（忽略本地备份）
-- `2dc8bc1`：Day12 上位机按钮化命令控制
-- `5ea5acf`：Day13 参数持久化与自动恢复
+- 日志目录：`logs/`
+- 报告脚本：
 
-## 9. 后续计划
+```powershell
+py "D:\codex\project A\pc_tools\make_demo_report.py" "D:\codex\project A\logs\day11_demo_run.csv"
+```
 
-- Day14：UI 中文化 + 连接状态灯
-- Day15+：接入真实 VL53L0X（焊接后）替换模拟距离通道
-- 后续阶段：FreeRTOS 多任务拆分与模块化
+当 CSV 无帧数据时，报告会输出 `WARN: no frame rows found...`，用于快速识别串口链路问题。
 
+## 7. 里程碑提交（节选）
+
+- `8439492` Day1-Day10 基础整合
+- `335b9fc` Day15 UI 中文化 + 串口状态显示
+- `52837a1` 串口切到 USART2 (PA2/PA3)
+- `e528c91` 双串口并行兜底（USART1 + USART2）
+
+## 8. 剩余工作（硬件相关）
+
+以下属于硬件在环，无法在纯离线条件下一次性完结：
+
+- 接入真实 VL53L0X 替换模拟距离通道
+- 板级最终接线固定与稳定性长跑（连续 30 分钟+）
+- 最终演示录像与现场证据采集

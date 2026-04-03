@@ -325,6 +325,7 @@ def main():
     start = time.time()
     last_rx = 0.0
     last_warn = 0.0
+    no_data_warn_count = 0
     current_port = None
     ser = None
     csv_fp = None
@@ -585,11 +586,16 @@ def main():
                         print(f"RAW: {line}")
             else:
                 if now - last_rx > 3 and now - last_warn > 3:
+                    no_data_warn_count += 1
                     print(
                         f"[WARN] No data on {current_port} for 3s. "
                         "Press RST once. If still no data, auto-switch port."
                     )
                     set_status(f"{current_port} 3秒无数据，尝试切换", False)
+                    if no_data_warn_count in (1, 3):
+                        print("[TIP] 确认没有其他程序占用串口（如另一个 miniterm/viewer）。")
+                        print("[TIP] 先做单向监听：PA2->CH340 RXD + GND，共地后按 RST 看 BOOT_/SIM。")
+                        print("[TIP] 若仍无数据，尝试 USART1 备份口：PA9->CH340 RXD（固件支持 USART1+USART2）。")
                     last_warn = now
                     if args.port.lower() == "auto":
                         other = probe_other_port_with_data(current_port, args.baud)

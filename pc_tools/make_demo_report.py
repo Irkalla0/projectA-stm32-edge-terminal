@@ -49,6 +49,8 @@ def main():
     print(f"CSV: {path}")
     print(f"Total frame: {total}")
     print(f"CRC pass: {crc_ok}/{total}")
+    if total == 0:
+        print("WARN: no frame rows found (check UART link, COM port, or capture duration)")
     print(f"CMD count: {dict(cmd_cnt)}")
     print(f"A1 alarm count(cmd=161): {cmd_cnt.get('161', 0)}")
     print(f"A2 alarm count(cmd=162): {cmd_cnt.get('162', 0)}")
