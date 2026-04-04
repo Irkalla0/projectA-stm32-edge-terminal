@@ -52,6 +52,19 @@ typedef enum
   UPG_STATE_ERROR
 } upgrade_state_t;
 
+typedef struct
+{
+  uint8_t active_slot;
+  uint8_t pending_slot;
+  uint8_t boot_attempts;
+  uint8_t last_result;
+  uint32_t seq;
+  uint32_t slot_a_size;
+  uint32_t slot_a_crc32;
+  uint32_t slot_b_size;
+  uint32_t slot_b_crc32;
+} boot_state_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -61,6 +74,13 @@ typedef enum
 #define UPG_MAX_CHUNK_BYTES 128U
 #define UPG_CMD_BUF_SIZE 384U
 #define UPG_MAX_IMAGE_BYTES (1024U * 1024U)
+#define UPG_TRIAL_MAX_ATTEMPTS 3U
+#define BOOT_SLOT_A 0U
+#define BOOT_SLOT_B 1U
+#define BOOT_SLOT_NONE 0xFFU
+#define BOOT_RESULT_UNKNOWN 0U
+#define BOOT_RESULT_OK 1U
+#define BOOT_RESULT_ROLLBACK 2U
 
 /* USER CODE END PD */
 
@@ -122,6 +142,18 @@ static uint32_t g_upg_expected_crc32 = 0;
 static uint32_t g_upg_received = 0;
 static uint32_t g_upg_running_crc32 = 0xFFFFFFFFU;
 static char g_upg_last_err[16] = "OK";
+static char g_upg_version[16] = "0.0.0";
+static uint8_t g_upg_target_slot = BOOT_SLOT_B;
+static boot_state_t g_boot_state = {
+    .active_slot = BOOT_SLOT_A,
+    .pending_slot = BOOT_SLOT_NONE,
+    .boot_attempts = 0,
+    .last_result = BOOT_RESULT_UNKNOWN,
+    .seq = 0,
+    .slot_a_size = 0,
+    .slot_a_crc32 = 0,
+    .slot_b_size = 0,
+    .slot_b_crc32 = 0};
 
 /* USER CODE END PV */
 
@@ -149,6 +181,15 @@ static void App_TaskStep(void);
 static int ParseU32Token(const char *text, uint32_t *out);
 static int ParseHexBytes(const char *hex, uint8_t *out, uint16_t max_len, uint16_t *out_len);
 static const char *Upg_StateName(upgrade_state_t state);
+static const char *Boot_SlotName(uint8_t slot);
+static const char *Boot_ResultName(uint8_t result);
+static uint8_t Boot_OtherSlot(uint8_t slot);
+static void Boot_SetSlotMeta(uint8_t slot, uint32_t size, uint32_t crc32);
+static void Boot_MarkPending(uint8_t slot);
+static void Boot_ConfirmPending(void);
+static void Boot_MarkRollback(void);
+static void Boot_PrintState(void);
+static void Upg_SetErrText(const char *err);
 static void Upg_SetErr(const char *err);
 static void Upg_ResetSession(void);
 void StartSampleTask(void *argument);
@@ -265,13 +306,108 @@ static const char *Upg_StateName(upgrade_state_t state)
   }
 }
 
-static void Upg_SetErr(const char *err)
+static const char *Boot_SlotName(uint8_t slot)
+{
+  switch (slot)
+  {
+  case BOOT_SLOT_A:
+    return "A";
+  case BOOT_SLOT_B:
+    return "B";
+  case BOOT_SLOT_NONE:
+    return "NONE";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static const char *Boot_ResultName(uint8_t result)
+{
+  switch (result)
+  {
+  case BOOT_RESULT_OK:
+    return "ok";
+  case BOOT_RESULT_ROLLBACK:
+    return "rollback";
+  case BOOT_RESULT_UNKNOWN:
+  default:
+    return "unknown";
+  }
+}
+
+static uint8_t Boot_OtherSlot(uint8_t slot)
+{
+  return (slot == BOOT_SLOT_B) ? BOOT_SLOT_A : BOOT_SLOT_B;
+}
+
+static void Boot_SetSlotMeta(uint8_t slot, uint32_t size, uint32_t crc32)
+{
+  if (slot == BOOT_SLOT_A)
+  {
+    g_boot_state.slot_a_size = size;
+    g_boot_state.slot_a_crc32 = crc32;
+  }
+  else if (slot == BOOT_SLOT_B)
+  {
+    g_boot_state.slot_b_size = size;
+    g_boot_state.slot_b_crc32 = crc32;
+  }
+}
+
+static void Boot_MarkPending(uint8_t slot)
+{
+  g_boot_state.pending_slot = slot;
+  g_boot_state.boot_attempts = 0;
+  g_boot_state.last_result = BOOT_RESULT_UNKNOWN;
+  g_boot_state.seq++;
+}
+
+static void Boot_ConfirmPending(void)
+{
+  if (g_boot_state.pending_slot == BOOT_SLOT_A || g_boot_state.pending_slot == BOOT_SLOT_B)
+    g_boot_state.active_slot = g_boot_state.pending_slot;
+  g_boot_state.pending_slot = BOOT_SLOT_NONE;
+  g_boot_state.boot_attempts = 0;
+  g_boot_state.last_result = BOOT_RESULT_OK;
+  g_boot_state.seq++;
+  g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+}
+
+static void Boot_MarkRollback(void)
+{
+  g_boot_state.pending_slot = BOOT_SLOT_NONE;
+  g_boot_state.boot_attempts = 0;
+  g_boot_state.last_result = BOOT_RESULT_ROLLBACK;
+  g_boot_state.seq++;
+  g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+}
+
+static void Boot_PrintState(void)
+{
+  printf("BOOT:active=%s,pending=%s,attempts=%u,last=%s,seq=%lu,slotA=%lu/0x%08lX,slotB=%lu/0x%08lX\r\n",
+         Boot_SlotName(g_boot_state.active_slot),
+         Boot_SlotName(g_boot_state.pending_slot),
+         (unsigned int)g_boot_state.boot_attempts,
+         Boot_ResultName(g_boot_state.last_result),
+         (unsigned long)g_boot_state.seq,
+         (unsigned long)g_boot_state.slot_a_size,
+         (unsigned long)g_boot_state.slot_a_crc32,
+         (unsigned long)g_boot_state.slot_b_size,
+         (unsigned long)g_boot_state.slot_b_crc32);
+}
+
+static void Upg_SetErrText(const char *err)
 {
   size_t n = strlen(err);
   if (n >= sizeof(g_upg_last_err))
     n = sizeof(g_upg_last_err) - 1U;
   memcpy(g_upg_last_err, err, n);
   g_upg_last_err[n] = '\0';
+}
+
+static void Upg_SetErr(const char *err)
+{
+  Upg_SetErrText(err);
   g_upg_state = UPG_STATE_ERROR;
 }
 
@@ -282,7 +418,8 @@ static void Upg_ResetSession(void)
   g_upg_expected_crc32 = 0;
   g_upg_received = 0;
   g_upg_running_crc32 = 0xFFFFFFFFU;
-  memcpy(g_upg_last_err, "OK", 3U);
+  g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+  Upg_SetErrText("OK");
 }
 
 static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum_centi)
@@ -492,7 +629,13 @@ static void Protocol_ProcessCommand(const char *cmd)
 
   if (strcmp(cmd_trim, "GET_CAP") == 0)
   {
-    printf("CAP:upgrade_uart=1,max_chunk=%u,dual_slot=0\r\n", (unsigned int)UPG_MAX_CHUNK_BYTES);
+    printf("CAP:upgrade_uart=1,max_chunk=%u,dual_slot=1\r\n", (unsigned int)UPG_MAX_CHUNK_BYTES);
+    return;
+  }
+
+  if (strcmp(cmd_trim, "GET_BOOTSTATE") == 0)
+  {
+    Boot_PrintState();
     return;
   }
 
@@ -521,14 +664,24 @@ static void Protocol_ProcessCommand(const char *cmd)
       printf("UPG_NACK BEGIN E_ARG\r\n");
       return;
     }
+    if (g_boot_state.pending_slot != BOOT_SLOT_NONE)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK BEGIN E_STATE\r\n");
+      return;
+    }
 
+    memset(g_upg_version, 0, sizeof(g_upg_version));
+    strncpy(g_upg_version, ver, sizeof(g_upg_version) - 1U);
     g_upg_expected_size = size;
     g_upg_expected_crc32 = image_crc;
     g_upg_received = 0;
     g_upg_running_crc32 = 0xFFFFFFFFU;
+    g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
     g_upg_state = UPG_STATE_RECEIVING;
-    memcpy(g_upg_last_err, "OK", 3U);
+    Upg_SetErrText("OK");
     printf("UPG_ACK BEGIN off=0\r\n");
+    printf("UPG_INFO target_slot=%s,ver=%s\r\n", Boot_SlotName(g_upg_target_slot), g_upg_version);
     return;
   }
 
@@ -595,7 +748,7 @@ static void Protocol_ProcessCommand(const char *cmd)
 
     g_upg_running_crc32 = CRC32_UpdateRaw(g_upg_running_crc32, chunk, chunk_len);
     g_upg_received += chunk_len;
-    memcpy(g_upg_last_err, "OK", 3U);
+    Upg_SetErrText("OK");
     printf("UPG_ACK DATA off=%lu\r\n", (unsigned long)g_upg_received);
     return;
   }
@@ -622,9 +775,14 @@ static void Protocol_ProcessCommand(const char *cmd)
       printf("UPG_NACK END E_CRC_IMAGE\r\n");
       return;
     }
+    Boot_SetSlotMeta(g_upg_target_slot, g_upg_expected_size, image_crc);
     g_upg_state = UPG_STATE_RECEIVED;
-    memcpy(g_upg_last_err, "OK", 3U);
+    Upg_SetErrText("OK");
     printf("UPG_ACK END\r\n");
+    printf("UPG_INFO image_slot=%s,size=%lu,crc=0x%08lX\r\n",
+           Boot_SlotName(g_upg_target_slot),
+           (unsigned long)g_upg_expected_size,
+           (unsigned long)image_crc);
     return;
   }
 
@@ -636,30 +794,65 @@ static void Protocol_ProcessCommand(const char *cmd)
       printf("UPG_NACK ACTIVATE E_STATE\r\n");
       return;
     }
+    g_upg_state = UPG_STATE_ACTIVATING;
+    Boot_MarkPending(g_upg_target_slot);
     g_upg_state = UPG_STATE_PENDING_CONFIRM;
-    memcpy(g_upg_last_err, "OK", 3U);
+    Upg_SetErrText("OK");
     printf("UPG_ACK ACTIVATE\r\n");
+    Boot_PrintState();
     return;
   }
 
   if (strcmp(cmd_trim, "UPG_CONFIRM") == 0)
   {
-    if (g_upg_state != UPG_STATE_PENDING_CONFIRM)
+    if (g_upg_state != UPG_STATE_PENDING_CONFIRM || g_boot_state.pending_slot == BOOT_SLOT_NONE)
     {
       Upg_SetErr("E_STATE");
       printf("UPG_NACK CONFIRM E_STATE\r\n");
       return;
     }
+    Boot_ConfirmPending();
     g_upg_state = UPG_STATE_CONFIRMED;
-    memcpy(g_upg_last_err, "OK", 3U);
+    Upg_SetErrText("OK");
     printf("UPG_ACK CONFIRM\r\n");
+    Boot_PrintState();
+    return;
+  }
+
+  if (strcmp(cmd_trim, "UPG_FAIL_ONCE") == 0)
+  {
+    if (g_boot_state.pending_slot == BOOT_SLOT_NONE)
+    {
+      Upg_SetErr("E_STATE");
+      printf("UPG_NACK FAIL E_STATE\r\n");
+      return;
+    }
+    if (g_boot_state.boot_attempts < 0xFFU)
+      g_boot_state.boot_attempts++;
+    if (g_boot_state.boot_attempts >= UPG_TRIAL_MAX_ATTEMPTS)
+    {
+      Boot_MarkRollback();
+      g_upg_state = UPG_STATE_ROLLBACK_REQUIRED;
+      Upg_SetErrText("E_TRIAL");
+      printf("UPG_ACK FAIL ROLLBACK\r\n");
+    }
+    else
+    {
+      g_boot_state.seq++;
+      Upg_SetErrText("OK");
+      printf("UPG_ACK FAIL attempts=%u\r\n", (unsigned int)g_boot_state.boot_attempts);
+    }
+    Boot_PrintState();
     return;
   }
 
   if (strcmp(cmd_trim, "UPG_ABORT") == 0)
   {
+    if (g_upg_state == UPG_STATE_PENDING_CONFIRM && g_boot_state.pending_slot != BOOT_SLOT_NONE)
+      Boot_MarkRollback();
     Upg_ResetSession();
     printf("UPG_ACK ABORT\r\n");
+    Boot_PrintState();
     return;
   }
 
@@ -909,10 +1102,11 @@ int main(void)
   printf("CMD: GET_PERIOD / SET_PERIOD <100-5000>\r\n");
   printf("CMD: GET_THR / SET_THR_T <0-80> / SET_THR_H <0-100>\r\n");
   printf("CMD: GET_THR2 / SET_THR_D <50-4000> / SET_THR_I <100-5000>\r\n");
-  printf("CMD: GET_VER / GET_CAP / UPG_STATUS / UPG_ABORT\r\n");
+  printf("CMD: GET_VER / GET_CAP / GET_BOOTSTATE / UPG_STATUS / UPG_ABORT\r\n");
   printf("CMD: UPG_BEGIN <ver> <size> <crc32> / UPG_DATA <off> <hex> <crc32>\r\n");
-  printf("CMD: UPG_END / UPG_ACTIVATE / UPG_CONFIRM\r\n");
+  printf("CMD: UPG_END / UPG_ACTIVATE / UPG_CONFIRM / UPG_FAIL_ONCE\r\n");
   Upg_ResetSession();
+  Boot_PrintState();
   g_last_sample_tick = HAL_GetTick();
 
   /* USER CODE END 2 */

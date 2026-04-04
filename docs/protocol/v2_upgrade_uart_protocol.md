@@ -19,7 +19,8 @@ Host should query capability before upgrade:
 Suggested responses:
 
 - `VER:app=1.4.0,boot=0.1.0`
-- `CAP:upgrade_uart=1,max_chunk=128,dual_slot=0`
+- `CAP:upgrade_uart=1,max_chunk=128,dual_slot=1`
+- `BOOT:active=A,pending=NONE,attempts=0,last=unknown,seq=0,...`
 
 ## 3. Upgrade State Model
 
@@ -77,6 +78,21 @@ Status query:
   `UPG_CONFIRM`
 - response:
   - `UPG_ACK CONFIRM`
+
+### 4.7 Boot State Query (Optional but Recommended)
+
+- request:
+  `GET_BOOTSTATE`
+- response:
+  - `BOOT:active=<A|B>,pending=<A|B|NONE>,attempts=<n>,last=<unknown|ok|rollback>,seq=<n>,...`
+
+### 4.8 Trial Failure Simulation (Lab Only)
+
+- request:
+  `UPG_FAIL_ONCE`
+- response:
+  - `UPG_ACK FAIL attempts=<n>`
+  - or `UPG_ACK FAIL ROLLBACK` (when threshold reached)
 
 ### 4.6 Abort
 

@@ -37,3 +37,40 @@ py "D:\codex\project A\pc_tools\uart_upgrade_client.py" `
   --confirm `
   --abort-on-fail
 ```
+
+The upgrader now queries `GET_BOOTSTATE` automatically before and after activate/confirm.
+
+## 5) Prepare / inspect rollback boot state
+
+Create an initial state blob:
+
+```powershell
+py "D:\codex\project A\tools\boot_state_tool.py" create `
+  --out "D:\codex\project A\build\v2\boot_state.bin" `
+  --active-slot A `
+  --pending-slot NONE `
+  --slot-a-size 0 `
+  --slot-a-crc32 0x00000000 `
+  --slot-b-size 0 `
+  --slot-b-crc32 0x00000000
+```
+
+Inspect state integrity (`--strict` fails when CRC is invalid):
+
+```powershell
+py "D:\codex\project A\tools\boot_state_tool.py" inspect `
+  --input "D:\codex\project A\build\v2\boot_state.bin" `
+  --strict
+```
+
+Mark slot B as pending and then confirm:
+
+```powershell
+py "D:\codex\project A\tools\boot_state_tool.py" set-pending `
+  --input "D:\codex\project A\build\v2\boot_state.bin" `
+  --slot B
+
+py "D:\codex\project A\tools\boot_state_tool.py" confirm `
+  --input "D:\codex\project A\build\v2\boot_state.bin" `
+  --slot B
+```

@@ -27,6 +27,7 @@ NACK_RE = re.compile(r"^UPG_NACK\s+(\w+)\s+(\S+)")
 ACK_DATA_RE = re.compile(r"^UPG_ACK DATA off=(\d+)$")
 CAP_RE = re.compile(r"^CAP:upgrade_uart=(\d+),max_chunk=(\d+),dual_slot=(\d+)$")
 STATUS_RE = re.compile(r"^UPG_STATUS:([^,]+),off=(\d+),err=(.+)$")
+BOOT_RE = re.compile(r"^BOOT:active=.*$")
 
 
 def list_candidate_ports(preferred: str) -> list[str]:
@@ -170,6 +171,7 @@ def do_upgrade(args: argparse.Namespace) -> int:
         # Optional info probes
         query_optional(ser, "GET_VER", re.compile(r"^VER:app=.*"), args.ack_timeout)
         cap_line = query_optional(ser, "GET_CAP", CAP_RE, args.ack_timeout)
+        query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
         query_optional(ser, "UPG_STATUS", STATUS_RE, args.ack_timeout)
 
         chunk_size = args.chunk
@@ -225,6 +227,7 @@ def do_upgrade(args: argparse.Namespace) -> int:
                 args.ack_timeout,
                 "UPG_ACTIVATE",
             )
+            query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
 
         if args.confirm:
             send_cmd(ser, "UPG_CONFIRM")
@@ -234,6 +237,7 @@ def do_upgrade(args: argparse.Namespace) -> int:
                 args.ack_timeout,
                 "UPG_CONFIRM",
             )
+            query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
 
         query_optional(ser, "UPG_STATUS", STATUS_RE, args.ack_timeout)
         print("[OK] UART upgrade flow completed.")
@@ -284,4 +288,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
