@@ -74,3 +74,15 @@ py "D:\codex\project A\tools\boot_state_tool.py" confirm `
   --input "D:\codex\project A\build\v2\boot_state.bin" `
   --slot B
 ```
+
+## 6) Simulate bootloader decision flow (no hardware required)
+
+```powershell
+py "D:\codex\project A\tools\boot_policy_sim.py" decide `
+  --input "D:\codex\project A\build\v2\boot_state.bin" `
+  --max-attempts 3
+
+py "D:\codex\project A\tools\boot_policy_sim.py" step `
+  --input "D:\codex\project A\build\v2\boot_state.bin" `
+  --max-attempts 3
+```
