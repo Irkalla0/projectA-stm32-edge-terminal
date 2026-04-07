@@ -130,3 +130,41 @@ py "D:\codex\project A\pc_tools\make_demo_report.py" "D:\codex\project A\logs\da
 3. 上位机新增“升级页”并复用现有串口链路
 4. 完成异常用例：断电、错包、CRC 错、非法版本
 5. 第二阶段再做外部 SPI Flash 回滚与 CAN 升级链路
+
+## 11. 新增落地能力（2026-04-07）
+
+本仓库已新增“可执行”工具链，覆盖项目总策划中的三项扩展能力：
+
+1. 数据分析与预测
+2. 分布式传感网络（UART + MQTT 汇聚）
+3. 异常检测（规则 + EWMA/Z-score + IsolationForest）
+
+总策划文档（含硬件/软件表、接口、简历写法）：
+
+- `docs/projectA_rollout_master_plan.md`
+- `docs/projectA_rollout_master_plan.docx`
+
+PC 侧工具入口：
+
+- `pc_tools/README.md`
+- `pc_tools/v1_regression_check.py`
+- `pc_tools/v2_reliability_report.py`
+- `pc_tools/analyze_and_forecast.py`
+- `pc_tools/distributed_aggregator.py`
+- `pc_tools/mqtt_node_sim.py`
+
+快速命令（示例）：
+
+```powershell
+# V1 回归
+py "D:\codex\project A\pc_tools\v1_regression_check.py" "D:\codex\project A\logs\day11_demo_run.csv" --min-duration-s 60
+
+# 分析+预测+异常检测
+py "D:\codex\project A\pc_tools\analyze_and_forecast.py" "D:\codex\project A\logs\day11_demo_run.csv" "D:\codex\project A\logs\day14_demo.csv" --out-dir "D:\codex\project A\build\analysis"
+
+# 分布式聚合（先用 UART CSV）
+py "D:\codex\project A\pc_tools\distributed_aggregator.py" --serial-csv "D:\codex\project A\logs\run.csv"
+
+# MQTT 节点仿真
+py "D:\codex\project A\pc_tools\mqtt_node_sim.py" --node-id esp32_sim_01 --runtime-s 120
+```
