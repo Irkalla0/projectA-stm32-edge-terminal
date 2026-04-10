@@ -65,6 +65,14 @@ typedef struct
   uint32_t slot_b_crc32;
 } boot_state_t;
 
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  boot_state_t state;
+  uint32_t crc32;
+} boot_state_record_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -81,6 +89,14 @@ typedef struct
 #define BOOT_RESULT_UNKNOWN 0U
 #define BOOT_RESULT_OK 1U
 #define BOOT_RESULT_ROLLBACK 2U
+#define W25_SPI_TIMEOUT_MS 100U
+#define W25_READY_TIMEOUT_MS 3000U
+#define W25_CS_GPIO_Port GPIOB
+#define W25_CS_Pin GPIO_PIN_12
+#define W25_JEDEC_ID_W25Q128 0xEF4018UL
+#define W25_BOOT_META_ADDR 0x00FF0000UL
+#define W25_BOOT_META_MAGIC 0x42535445UL /* "BSTE" */
+#define W25_BOOT_META_VERSION 0x00000001UL
 
 /* USER CODE END PD */
 
@@ -92,6 +108,7 @@ typedef struct
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
+SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -114,7 +131,9 @@ const osThreadAttr_t sampleTask_attributes = {
 osThreadId_t cmdTaskHandle;
 const osThreadAttr_t cmdTask_attributes = {
   .name = "cmdTask",
-  .stack_size = 384 * 4,
+  /* UPG_DATA command parsing uses large local buffers and printf/sscanf;
+   * keep a larger margin to avoid stack overflow under noisy UART traffic. */
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
 
@@ -133,8 +152,13 @@ static float g_temp_alarm_th_c = 28.5f;
 static float g_hum_alarm_th_rh = 68.0f;
 static uint16_t g_dist_alarm_th_mm = 600;
 static uint16_t g_curr_alarm_th_ma = 900;
-static char g_cmd_buf[UPG_CMD_BUF_SIZE];
-static uint16_t g_cmd_len = 0;
+typedef struct
+{
+  char buf[UPG_CMD_BUF_SIZE];
+  uint16_t len;
+} cmd_rx_ctx_t;
+static cmd_rx_ctx_t g_cmd_rx_uart1 = {{0}, 0};
+static cmd_rx_ctx_t g_cmd_rx_uart2 = {{0}, 0};
 static uint32_t g_last_sample_tick = 0;
 static upgrade_state_t g_upg_state = UPG_STATE_IDLE;
 static uint32_t g_upg_expected_size = 0;
@@ -154,6 +178,8 @@ static boot_state_t g_boot_state = {
     .slot_a_crc32 = 0,
     .slot_b_size = 0,
     .slot_b_crc32 = 0};
+static uint8_t g_w25_ready = 0U;
+static uint32_t g_w25_jedec_id = 0U;
 
 /* USER CODE END PV */
 
@@ -162,6 +188,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
+static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
@@ -175,7 +202,7 @@ static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len);
 static uint32_t CRC32_UpdateRaw(uint32_t crc, const uint8_t *data, uint16_t len);
 static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum_centi);
 static void Protocol_ProcessCommand(const char *cmd);
-static void Protocol_HandleRxByte(uint8_t ch);
+static void Protocol_HandleRxByte(cmd_rx_ctx_t *ctx, uint8_t ch);
 static void Protocol_PollRx(void);
 static void App_TaskStep(void);
 static int ParseU32Token(const char *text, uint32_t *out);
@@ -189,6 +216,16 @@ static void Boot_MarkPending(uint8_t slot);
 static void Boot_ConfirmPending(void);
 static void Boot_MarkRollback(void);
 static void Boot_PrintState(void);
+static HAL_StatusTypeDef W25_Init(void);
+static HAL_StatusTypeDef W25_ReadJedecId(uint32_t *id);
+static HAL_StatusTypeDef W25_WriteEnable(void);
+static HAL_StatusTypeDef W25_ReadStatus1(uint8_t *status1);
+static HAL_StatusTypeDef W25_WaitReady(uint32_t timeout_ms);
+static HAL_StatusTypeDef W25_ReadData(uint32_t addr, uint8_t *buf, uint16_t len);
+static HAL_StatusTypeDef W25_PageProgram(uint32_t addr, const uint8_t *buf, uint16_t len);
+static HAL_StatusTypeDef W25_SectorErase4K(uint32_t addr);
+static void Boot_LoadFromW25(void);
+static void Boot_SaveToW25(void);
 static void Upg_SetErrText(const char *err);
 static void Upg_SetErr(const char *err);
 static void Upg_ResetSession(void);
@@ -352,6 +389,7 @@ static void Boot_SetSlotMeta(uint8_t slot, uint32_t size, uint32_t crc32)
     g_boot_state.slot_b_size = size;
     g_boot_state.slot_b_crc32 = crc32;
   }
+  Boot_SaveToW25();
 }
 
 static void Boot_MarkPending(uint8_t slot)
@@ -360,6 +398,7 @@ static void Boot_MarkPending(uint8_t slot)
   g_boot_state.boot_attempts = 0;
   g_boot_state.last_result = BOOT_RESULT_UNKNOWN;
   g_boot_state.seq++;
+  Boot_SaveToW25();
 }
 
 static void Boot_ConfirmPending(void)
@@ -371,6 +410,7 @@ static void Boot_ConfirmPending(void)
   g_boot_state.last_result = BOOT_RESULT_OK;
   g_boot_state.seq++;
   g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+  Boot_SaveToW25();
 }
 
 static void Boot_MarkRollback(void)
@@ -380,6 +420,7 @@ static void Boot_MarkRollback(void)
   g_boot_state.last_result = BOOT_RESULT_ROLLBACK;
   g_boot_state.seq++;
   g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+  Boot_SaveToW25();
 }
 
 static void Boot_PrintState(void)
@@ -394,6 +435,229 @@ static void Boot_PrintState(void)
          (unsigned long)g_boot_state.slot_a_crc32,
          (unsigned long)g_boot_state.slot_b_size,
          (unsigned long)g_boot_state.slot_b_crc32);
+}
+
+static void W25_CS_Low(void)
+{
+  HAL_GPIO_WritePin(W25_CS_GPIO_Port, W25_CS_Pin, GPIO_PIN_RESET);
+}
+
+static void W25_CS_High(void)
+{
+  HAL_GPIO_WritePin(W25_CS_GPIO_Port, W25_CS_Pin, GPIO_PIN_SET);
+}
+
+static HAL_StatusTypeDef W25_ReadJedecId(uint32_t *id)
+{
+  uint8_t tx[4] = {0x9FU, 0xFFU, 0xFFU, 0xFFU};
+  uint8_t rx[4] = {0};
+  if (id == NULL)
+    return HAL_ERROR;
+
+  W25_CS_Low();
+  if (HAL_SPI_TransmitReceive(&hspi1, tx, rx, 4, W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  *id = ((uint32_t)rx[1] << 16) | ((uint32_t)rx[2] << 8) | (uint32_t)rx[3];
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef W25_WriteEnable(void)
+{
+  uint8_t cmd = 0x06U;
+  W25_CS_Low();
+  if (HAL_SPI_Transmit(&hspi1, &cmd, 1, W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef W25_ReadStatus1(uint8_t *status1)
+{
+  uint8_t tx[2] = {0x05U, 0xFFU};
+  uint8_t rx[2] = {0};
+  if (status1 == NULL)
+    return HAL_ERROR;
+
+  W25_CS_Low();
+  if (HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2, W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  *status1 = rx[1];
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef W25_WaitReady(uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+  uint8_t sr1 = 0;
+  while ((HAL_GetTick() - start) < timeout_ms)
+  {
+    if (W25_ReadStatus1(&sr1) != HAL_OK)
+      return HAL_ERROR;
+    if ((sr1 & 0x01U) == 0U)
+      return HAL_OK;
+    HAL_Delay(1);
+  }
+  return HAL_TIMEOUT;
+}
+
+static HAL_StatusTypeDef W25_ReadData(uint32_t addr, uint8_t *buf, uint16_t len)
+{
+  uint8_t cmd[4] = {
+      0x03U,
+      (uint8_t)((addr >> 16) & 0xFFU),
+      (uint8_t)((addr >> 8) & 0xFFU),
+      (uint8_t)(addr & 0xFFU)};
+
+  if (buf == NULL || len == 0U)
+    return HAL_ERROR;
+
+  W25_CS_Low();
+  if (HAL_SPI_Transmit(&hspi1, cmd, sizeof(cmd), W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  if (HAL_SPI_Receive(&hspi1, buf, len, W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef W25_PageProgram(uint32_t addr, const uint8_t *buf, uint16_t len)
+{
+  uint8_t cmd[4] = {
+      0x02U,
+      (uint8_t)((addr >> 16) & 0xFFU),
+      (uint8_t)((addr >> 8) & 0xFFU),
+      (uint8_t)(addr & 0xFFU)};
+
+  if (buf == NULL || len == 0U || len > 256U)
+    return HAL_ERROR;
+  if (((addr & 0xFFU) + len) > 256U)
+    return HAL_ERROR;
+  if (W25_WriteEnable() != HAL_OK)
+    return HAL_ERROR;
+
+  W25_CS_Low();
+  if (HAL_SPI_Transmit(&hspi1, cmd, sizeof(cmd), W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  if (HAL_SPI_Transmit(&hspi1, (uint8_t *)buf, len, W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  return W25_WaitReady(W25_READY_TIMEOUT_MS);
+}
+
+static HAL_StatusTypeDef W25_SectorErase4K(uint32_t addr)
+{
+  uint8_t cmd[4] = {
+      0x20U,
+      (uint8_t)((addr >> 16) & 0xFFU),
+      (uint8_t)((addr >> 8) & 0xFFU),
+      (uint8_t)(addr & 0xFFU)};
+
+  if (W25_WriteEnable() != HAL_OK)
+    return HAL_ERROR;
+
+  W25_CS_Low();
+  if (HAL_SPI_Transmit(&hspi1, cmd, sizeof(cmd), W25_SPI_TIMEOUT_MS) != HAL_OK)
+  {
+    W25_CS_High();
+    return HAL_ERROR;
+  }
+  W25_CS_High();
+  return W25_WaitReady(W25_READY_TIMEOUT_MS);
+}
+
+static HAL_StatusTypeDef W25_Init(void)
+{
+  uint32_t id = 0;
+
+  W25_CS_High();
+  HAL_Delay(1);
+
+  if (W25_ReadJedecId(&id) != HAL_OK)
+    return HAL_ERROR;
+
+  g_w25_jedec_id = id;
+  if (id == 0x000000UL || id == 0xFFFFFFUL)
+    return HAL_ERROR;
+
+  g_w25_ready = 1U;
+  return HAL_OK;
+}
+
+static void Boot_LoadFromW25(void)
+{
+  boot_state_record_t rec = {0};
+  uint32_t calc_crc = 0;
+
+  if (!g_w25_ready)
+    return;
+
+  if (W25_ReadData(W25_BOOT_META_ADDR, (uint8_t *)&rec, (uint16_t)sizeof(rec)) != HAL_OK)
+  {
+    printf("BOOT_META:load_err\r\n");
+    return;
+  }
+
+  calc_crc = CRC32_UpdateRaw(0xFFFFFFFFU, (const uint8_t *)&rec, (uint16_t)(sizeof(rec) - sizeof(rec.crc32))) ^ 0xFFFFFFFFU;
+  if (rec.magic != W25_BOOT_META_MAGIC || rec.version != W25_BOOT_META_VERSION || rec.crc32 != calc_crc)
+  {
+    Boot_SaveToW25();
+    printf("BOOT_META:init_default\r\n");
+    return;
+  }
+
+  g_boot_state = rec.state;
+  if (g_boot_state.active_slot != BOOT_SLOT_A && g_boot_state.active_slot != BOOT_SLOT_B)
+    g_boot_state.active_slot = BOOT_SLOT_A;
+  if (g_boot_state.pending_slot != BOOT_SLOT_A && g_boot_state.pending_slot != BOOT_SLOT_B && g_boot_state.pending_slot != BOOT_SLOT_NONE)
+    g_boot_state.pending_slot = BOOT_SLOT_NONE;
+  g_upg_target_slot = Boot_OtherSlot(g_boot_state.active_slot);
+  printf("BOOT_META:loaded seq=%lu\r\n", (unsigned long)g_boot_state.seq);
+}
+
+static void Boot_SaveToW25(void)
+{
+  boot_state_record_t rec = {0};
+
+  if (!g_w25_ready)
+    return;
+
+  rec.magic = W25_BOOT_META_MAGIC;
+  rec.version = W25_BOOT_META_VERSION;
+  rec.state = g_boot_state;
+  rec.crc32 = CRC32_UpdateRaw(0xFFFFFFFFU, (const uint8_t *)&rec, (uint16_t)(sizeof(rec) - sizeof(rec.crc32))) ^ 0xFFFFFFFFU;
+
+  if (W25_SectorErase4K(W25_BOOT_META_ADDR) != HAL_OK)
+  {
+    printf("BOOT_META:save_err:erase\r\n");
+    return;
+  }
+  if (W25_PageProgram(W25_BOOT_META_ADDR, (const uint8_t *)&rec, (uint16_t)sizeof(rec)) != HAL_OK)
+  {
+    printf("BOOT_META:save_err:prog\r\n");
+  }
 }
 
 static void Upg_SetErrText(const char *err)
@@ -633,6 +897,52 @@ static void Protocol_ProcessCommand(const char *cmd)
     return;
   }
 
+  if (strcmp(cmd_trim, "GET_FLASH") == 0 || strcmp(cmd_trim, "FLASH_ID") == 0)
+  {
+    uint32_t id = 0;
+    if (W25_ReadJedecId(&id) == HAL_OK)
+    {
+      g_w25_jedec_id = id;
+      g_w25_ready = (id != 0x000000UL && id != 0xFFFFFFUL) ? 1U : 0U;
+      printf("FLASH:id=0x%06lX,ready=%u,expect=0x%06lX\r\n",
+             (unsigned long)g_w25_jedec_id,
+             (unsigned int)g_w25_ready,
+             (unsigned long)W25_JEDEC_ID_W25Q128);
+    }
+    else
+    {
+      g_w25_ready = 0U;
+      printf("FLASH:ERR\r\n");
+    }
+    return;
+  }
+
+  if (strcmp(cmd_trim, "BOOT_SAVE") == 0)
+  {
+    if (!g_w25_ready)
+    {
+      printf("BOOT_SAVE:ERR:NO_FLASH\r\n");
+      return;
+    }
+    Boot_SaveToW25();
+    printf("BOOT_SAVE:OK\r\n");
+    Boot_PrintState();
+    return;
+  }
+
+  if (strcmp(cmd_trim, "BOOT_LOAD") == 0)
+  {
+    if (!g_w25_ready)
+    {
+      printf("BOOT_LOAD:ERR:NO_FLASH\r\n");
+      return;
+    }
+    Boot_LoadFromW25();
+    printf("BOOT_LOAD:OK\r\n");
+    Boot_PrintState();
+    return;
+  }
+
   if (strcmp(cmd_trim, "GET_BOOTSTATE") == 0)
   {
     Boot_PrintState();
@@ -839,6 +1149,7 @@ static void Protocol_ProcessCommand(const char *cmd)
     else
     {
       g_boot_state.seq++;
+      Boot_SaveToW25();
       Upg_SetErrText("OK");
       printf("UPG_ACK FAIL attempts=%u\r\n", (unsigned int)g_boot_state.boot_attempts);
     }
@@ -860,26 +1171,42 @@ static void Protocol_ProcessCommand(const char *cmd)
     printf("CMD_ERR:%s\r\n", cmd_trim);
 }
 
-static void Protocol_HandleRxByte(uint8_t ch)
+static void Protocol_HandleRxByte(cmd_rx_ctx_t *ctx, uint8_t ch)
 {
+  if (ctx == NULL)
+    return;
+
   if (ch == '\r')
     return;
 
   if (ch == '\n')
   {
-    g_cmd_buf[g_cmd_len] = '\0';
-    Protocol_ProcessCommand(g_cmd_buf);
-    g_cmd_len = 0;
+    if (ctx->len > 0U)
+    {
+      ctx->buf[ctx->len] = '\0';
+      Protocol_ProcessCommand(ctx->buf);
+    }
+    ctx->len = 0;
     return;
   }
 
-  if (g_cmd_len < (sizeof(g_cmd_buf) - 1))
+  if (ch == '\t')
+    ch = ' ';
+
+  /* Ignore binary/noise bytes so a floating RX pin does not corrupt parser. */
+  if (ch < 0x20U || ch > 0x7EU)
   {
-    g_cmd_buf[g_cmd_len++] = (char)ch;
+    ctx->len = 0;
+    return;
+  }
+
+  if (ctx->len < (UPG_CMD_BUF_SIZE - 1U))
+  {
+    ctx->buf[ctx->len++] = (char)ch;
   }
   else
   {
-    g_cmd_len = 0;
+    ctx->len = 0;
   }
 }
 
@@ -887,14 +1214,19 @@ static void Protocol_PollRx(void)
 {
   uint8_t ch = 0;
   while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
-    Protocol_HandleRxByte(ch);
+    Protocol_HandleRxByte(&g_cmd_rx_uart1, ch);
   while (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK)
-    Protocol_HandleRxByte(ch);
+    Protocol_HandleRxByte(&g_cmd_rx_uart2, ch);
 }
 
 static void App_TaskStep(void)
 {
   uint32_t now = HAL_GetTick();
+
+  /* During UART upgrade transfer, suppress periodic telemetry spam so the
+   * command channel can sustain long UPG_DATA lines reliably. */
+  if (g_upg_state == UPG_STATE_RECEIVING)
+    return;
 
   if ((now - g_last_sample_tick) < g_sample_period_ms)
     return;
@@ -1083,10 +1415,22 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
+  MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   printf("BOOT_V3_DUAL_I2C_SCAN\r\n");
+  if (W25_Init() == HAL_OK)
+  {
+    printf("W25_READY:id=0x%06lX%s\r\n",
+           (unsigned long)g_w25_jedec_id,
+           (g_w25_jedec_id == W25_JEDEC_ID_W25Q128) ? "" : " (NON-W25Q128)");
+    Boot_LoadFromW25();
+  }
+  else
+  {
+    printf("W25_NOT_FOUND (check PA5/PA6/PA7 + PB12-CS + VCC/GND)\r\n");
+  }
   I2C_PrintScanAll();
   Sensor_Detect();
   if (g_sensor_type == SENSOR_SHT3X && g_sensor_addr == SHT30_ADDR_44)
@@ -1105,6 +1449,7 @@ int main(void)
   printf("CMD: GET_VER / GET_CAP / GET_BOOTSTATE / UPG_STATUS / UPG_ABORT\r\n");
   printf("CMD: UPG_BEGIN <ver> <size> <crc32> / UPG_DATA <off> <hex> <crc32>\r\n");
   printf("CMD: UPG_END / UPG_ACTIVATE / UPG_CONFIRM / UPG_FAIL_ONCE\r\n");
+  printf("CMD: FLASH_ID(GET_FLASH) / BOOT_SAVE / BOOT_LOAD\r\n");
   Upg_ResetSession();
   Boot_PrintState();
   g_last_sample_tick = HAL_GetTick();
@@ -1285,6 +1630,43 @@ static void MX_I2C2_Init(void)
 }
 
 /**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -1362,6 +1744,7 @@ static void MX_USART2_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -1371,6 +1754,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  HAL_GPIO_WritePin(W25_CS_GPIO_Port, W25_CS_Pin, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = W25_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(W25_CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
