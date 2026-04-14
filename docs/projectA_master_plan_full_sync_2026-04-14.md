@@ -152,6 +152,13 @@
 - 分支：`codex/w25q128-integration`
 - 推送后作为后续执行唯一任务清单。
 
+## 5.1 执行入口文件
+- 全量实施手册：`docs/projectA_all_in_one_execution_and_wiring_2026-04-14.md`
+- 阶段脚本：`tools/projectA_full_rollout.ps1`
+- 单命令串口验证：`pc_tools/uart_cmd_once.py`
+- 一页总结：`docs/projectA_one_page_summary.md`
+- 简历条目：`docs/resume_projectA_bullets.md`
+
 ## 6. 每次开工使用模板
 ```text
 今日目标：<M1/M2/...>
