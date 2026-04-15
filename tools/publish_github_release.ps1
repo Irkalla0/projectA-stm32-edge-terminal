@@ -4,6 +4,10 @@
   [string]$TargetCommitish = "main",
   [string]$ReleaseName = "Project A v2.0.0-final",
   [string]$BodyFile,
+  [string[]]$AssetFiles = @(),
+  [switch]$UploadAssets,
+  [switch]$AutoAssets,
+  [switch]$OverwriteAssets,
   [switch]$Draft,
   [switch]$Prerelease,
   [switch]$DryRun
@@ -48,15 +52,76 @@ function Read-Body {
   return [System.IO.File]::ReadAllText($resolved, [System.Text.Encoding]::UTF8)
 }
 
+function Resolve-UploadAssets {
+  param(
+    [string]$Root,
+    [string[]]$Files,
+    [bool]$UseAuto
+  )
+
+  $candidates = @()
+  if ($UseAuto) {
+    $candidates += @(
+      "build\v2\upgrade_package.bin",
+      "build\v2\upgrade_manifest.json",
+      "docs\projectA_release_note_v2.0.0-final.md",
+      "docs\projectA_final_runbook.md",
+      "docs\projectA_final_wiring.md",
+      "docs\projectA_final_audit_checklist.md",
+      "docs\protocol\v2_upgrade_can_tunnel.md",
+      "docs\protocol\v2_upgrade_uart_protocol.md",
+      "docs\protocol\v2_boot_state_layout.md"
+    )
+  }
+  $candidates += $Files
+
+  $resolvedAssets = @()
+  $seen = @{}
+  foreach ($f in $candidates) {
+    if (-not $f) { continue }
+
+    $p = $f
+    if (-not [System.IO.Path]::IsPathRooted($p)) {
+      $p = Join-Path $Root $p
+    }
+
+    try {
+      $resolved = (Resolve-Path -LiteralPath $p).Path
+      if (-not $seen.ContainsKey($resolved)) {
+        $seen[$resolved] = $true
+        $resolvedAssets += $resolved
+      }
+    } catch {
+      Write-Host "Skip missing asset: $p" -ForegroundColor DarkYellow
+    }
+  }
+
+  return $resolvedAssets
+}
+
+function Upload-ReleaseAsset {
+  param(
+    [string]$UploadBaseUrl,
+    [hashtable]$Headers,
+    [string]$FilePath
+  )
+
+  $fileName = [System.IO.Path]::GetFileName($FilePath)
+  $uploadUrl = "$UploadBaseUrl?name=$([System.Uri]::EscapeDataString($fileName))"
+  return Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $Headers -ContentType "application/octet-stream" -InFile $FilePath
+}
+
 $repoInfo = Resolve-RepoInfo -Root $RepoRoot
 $owner = $repoInfo.owner
 $repo = $repoInfo.repo
 $baseApi = "https://api.github.com/repos/$owner/$repo"
 $bodyText = Read-Body -Path $BodyFile
+$resolvedAssets = Resolve-UploadAssets -Root $RepoRoot -Files $AssetFiles -UseAuto ([bool]$AutoAssets)
 
 Write-Host "Repo: $owner/$repo" -ForegroundColor Cyan
 Write-Host "Tag : $Tag" -ForegroundColor Cyan
 Write-Host "Body: $BodyFile" -ForegroundColor Cyan
+Write-Host "Assets to upload: $($resolvedAssets.Count)" -ForegroundColor Cyan
 
 $payload = @{
   tag_name = $Tag
@@ -68,15 +133,24 @@ $payload = @{
 }
 
 if ($DryRun) {
-  Write-Host "" 
+  Write-Host ""
   Write-Host "[DRY RUN] Would create/update release with payload:" -ForegroundColor Yellow
   $payload | ConvertTo-Json -Depth 10
+
+  if ($UploadAssets) {
+    Write-Host ""
+    Write-Host "[DRY RUN] Would upload assets:" -ForegroundColor Yellow
+    foreach ($a in $resolvedAssets) {
+      Write-Host "  - $a"
+    }
+  }
+
   exit 0
 }
 
 $token = Get-Token
 if (-not $token) {
-  Write-Host "" 
+  Write-Host ""
   Write-Host "Missing GH_TOKEN/GITHUB_TOKEN. Set one token and rerun." -ForegroundColor Red
   Write-Host "Example:" -ForegroundColor Yellow
   Write-Host "  `$env:GITHUB_TOKEN='YOUR_PAT'" -ForegroundColor Yellow
@@ -111,4 +185,44 @@ if ($existing -and $existing.id) {
 } else {
   $result = Invoke-RestMethod -Method Post -Uri "$baseApi/releases" -Headers $headers -ContentType "application/json" -Body ($payload | ConvertTo-Json -Depth 10)
   Write-Host "Created release: $($result.html_url)" -ForegroundColor Green
+}
+
+if ($UploadAssets) {
+  $uploadBase = ($result.upload_url -replace '\{.*$', '')
+  if (-not $uploadBase) {
+    throw "Cannot resolve release upload_url"
+  }
+
+  $existingAssets = @{}
+  if ($result.assets) {
+    foreach ($it in $result.assets) {
+      $existingAssets[$it.name] = $it
+    }
+  } else {
+    $fullRelease = Invoke-RestMethod -Method Get -Uri "$baseApi/releases/tags/$Tag" -Headers $headers
+    foreach ($it in $fullRelease.assets) {
+      $existingAssets[$it.name] = $it
+    }
+  }
+
+  $uploadedCount = 0
+  foreach ($asset in $resolvedAssets) {
+    $assetName = [System.IO.Path]::GetFileName($asset)
+    if ($existingAssets.ContainsKey($assetName)) {
+      if ($OverwriteAssets) {
+        $assetId = $existingAssets[$assetName].id
+        Invoke-RestMethod -Method Delete -Uri "$baseApi/releases/assets/$assetId" -Headers $headers | Out-Null
+        Write-Host "Deleted existing asset: $assetName" -ForegroundColor DarkYellow
+      } else {
+        Write-Host "Skip existing asset: $assetName (use -OverwriteAssets to replace)" -ForegroundColor DarkYellow
+        continue
+      }
+    }
+
+    $up = Upload-ReleaseAsset -UploadBaseUrl $uploadBase -Headers $headers -FilePath $asset
+    $uploadedCount += 1
+    Write-Host "Uploaded asset: $($up.name)" -ForegroundColor Green
+  }
+
+  Write-Host "Asset upload finished. Uploaded: $uploadedCount" -ForegroundColor Cyan
 }

@@ -29,3 +29,16 @@ py "D:\codex\project A\pc_tools\upgrade_client.py" --pkg "D:\codex\project A\bui
 ```powershell
 powershell -ExecutionPolicy Bypass -File "D:\codex\project A\tools\projectA_full_rollout.ps1" -Stage all -Port COM6 -Transport parallel -CanInterface slcan -CanChannel COM8 -CanBitrate 500000
 ```
+
+## Publish GitHub release (with assets)
+
+```powershell
+$env:GITHUB_TOKEN='YOUR_PAT'
+powershell -ExecutionPolicy Bypass -File "D:\codex\project A\tools\release_publish_all.ps1" -Tag v2.0.0-final -OverwriteAssets
+```
+
+### Dry run
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "D:\codex\project A\tools\release_publish_all.ps1" -Tag v2.0.0-final -DryRun
+```
