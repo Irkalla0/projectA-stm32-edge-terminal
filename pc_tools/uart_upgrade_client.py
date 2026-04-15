@@ -51,9 +51,32 @@ def open_serial(preferred: str, baud: int, timeout: float) -> tuple[serial.Seria
     raise RuntimeError(f"No usable serial port for --port {preferred}")
 
 
-def send_cmd(ser: serial.Serial, cmd: str) -> None:
-    ser.write((cmd + "\n").encode("ascii"))
-    ser.flush()
+def send_cmd(
+    ser: serial.Serial,
+    cmd: str,
+    *,
+    char_delay_ms: int = 0,
+    preflush_newlines: int = 0,
+) -> None:
+    payload = (cmd + "\n").encode("ascii")
+
+    # Optional parser flush for noisy links: push a few newlines so stale
+    # partial commands are terminated before sending the next command.
+    if preflush_newlines > 0:
+        ser.write(b"\n" * preflush_newlines)
+        ser.flush()
+        time.sleep(0.02)
+
+    if char_delay_ms <= 0:
+        ser.write(payload)
+        ser.flush()
+    else:
+        delay_s = char_delay_ms / 1000.0
+        for b in payload:
+            ser.write(bytes([b]))
+            ser.flush()
+            time.sleep(delay_s)
+
     print(f"[TX] {cmd}")
 
 
@@ -121,12 +144,27 @@ def wait_for_match(
     return None, None, None
 
 
-def query_optional(ser: serial.Serial, cmd: str, pat: re.Pattern[str], timeout_s: float) -> str | None:
-    send_cmd(ser, cmd)
-    name, _m, line = wait_for_match(ser, timeout_s, [("ok", pat)])
-    if name == "ok":
-        return line
-    print(f"[WARN] {cmd} response timeout")
+def query_optional(
+    ser: serial.Serial,
+    cmd: str,
+    pat: re.Pattern[str],
+    timeout_s: float,
+    retries: int,
+    char_delay_ms: int,
+    preflush_newlines: int,
+) -> str | None:
+    attempts = max(1, retries)
+    for idx in range(1, attempts + 1):
+        send_cmd(
+            ser,
+            cmd,
+            char_delay_ms=char_delay_ms,
+            preflush_newlines=preflush_newlines,
+        )
+        name, _m, line = wait_for_match(ser, timeout_s, [("ok", pat)])
+        if name == "ok":
+            return line
+        print(f"[WARN] {cmd} response timeout (try {idx}/{attempts})")
     return None
 
 
@@ -168,11 +206,72 @@ def do_upgrade(args: argparse.Namespace) -> int:
     ser, port = open_serial(args.port, args.baud, args.read_timeout)
     print(f"[INFO] Serial opened: {port} @ {args.baud}")
     try:
+        ctrl_delay_ms = (
+            args.ctrl_char_delay_ms
+            if args.ctrl_char_delay_ms >= 0
+            else args.char_delay_ms
+        )
+        data_delay_ms = (
+            args.data_char_delay_ms
+            if args.data_char_delay_ms >= 0
+            else args.char_delay_ms
+        )
+
+        if args.set_period_ms is not None:
+            send_cmd(
+                ser,
+                f"SET_PERIOD {args.set_period_ms}",
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
+            # Best effort: do not fail hard if this optional prep step times out.
+            query_optional(
+                ser,
+                "GET_PERIOD",
+                re.compile(r"^PERIOD:\d+$"),
+                args.ack_timeout,
+                retries=args.query_retries,
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
+
         # Optional info probes
-        query_optional(ser, "GET_VER", re.compile(r"^VER:app=.*"), args.ack_timeout)
-        cap_line = query_optional(ser, "GET_CAP", CAP_RE, args.ack_timeout)
-        query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
-        query_optional(ser, "UPG_STATUS", STATUS_RE, args.ack_timeout)
+        query_optional(
+            ser,
+            "GET_VER",
+            re.compile(r"^VER:app=.*"),
+            args.ack_timeout,
+            retries=args.query_retries,
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
+        cap_line = query_optional(
+            ser,
+            "GET_CAP",
+            CAP_RE,
+            args.ack_timeout,
+            retries=args.query_retries,
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
+        query_optional(
+            ser,
+            "GET_BOOTSTATE",
+            BOOT_RE,
+            args.ack_timeout,
+            retries=args.query_retries,
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
+        query_optional(
+            ser,
+            "UPG_STATUS",
+            STATUS_RE,
+            args.ack_timeout,
+            retries=args.query_retries,
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
 
         chunk_size = args.chunk
         if cap_line:
@@ -186,6 +285,8 @@ def do_upgrade(args: argparse.Namespace) -> int:
         send_cmd(
             ser,
             f"UPG_BEGIN {pkg['version']} {pkg['image_size']} 0x{pkg['image_crc32']:08X}",
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
         )
         expect_ack(ser, re.compile(r"^UPG_ACK BEGIN off=0$"), args.ack_timeout, "UPG_BEGIN")
 
@@ -199,6 +300,8 @@ def do_upgrade(args: argparse.Namespace) -> int:
             send_cmd(
                 ser,
                 f"UPG_DATA {offset} {chunk.hex().upper()} 0x{chunk_crc:08X}",
+                char_delay_ms=data_delay_ms,
+                preflush_newlines=args.preflush_newlines,
             )
             m = expect_ack(ser, ACK_DATA_RE, args.ack_timeout, f"UPG_DATA@{offset}")
             next_off = int(m.group(1))
@@ -216,37 +319,81 @@ def do_upgrade(args: argparse.Namespace) -> int:
                 print(f"[INFO] Progress: {offset}/{total} ({pct:.1f}%)")
                 last_print = now
 
-        send_cmd(ser, "UPG_END")
+        send_cmd(
+            ser,
+            "UPG_END",
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
         expect_ack(ser, re.compile(r"^UPG_ACK END$"), args.ack_timeout, "UPG_END")
 
         if args.activate:
-            send_cmd(ser, "UPG_ACTIVATE")
+            send_cmd(
+                ser,
+                "UPG_ACTIVATE",
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
             expect_ack(
                 ser,
                 re.compile(r"^UPG_ACK ACTIVATE$"),
                 args.ack_timeout,
                 "UPG_ACTIVATE",
             )
-            query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
+            query_optional(
+                ser,
+                "GET_BOOTSTATE",
+                BOOT_RE,
+                args.ack_timeout,
+                retries=args.query_retries,
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
 
         if args.confirm:
-            send_cmd(ser, "UPG_CONFIRM")
+            send_cmd(
+                ser,
+                "UPG_CONFIRM",
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
             expect_ack(
                 ser,
                 re.compile(r"^UPG_ACK CONFIRM$"),
                 args.ack_timeout,
                 "UPG_CONFIRM",
             )
-            query_optional(ser, "GET_BOOTSTATE", BOOT_RE, args.ack_timeout)
+            query_optional(
+                ser,
+                "GET_BOOTSTATE",
+                BOOT_RE,
+                args.ack_timeout,
+                retries=args.query_retries,
+                char_delay_ms=ctrl_delay_ms,
+                preflush_newlines=args.preflush_newlines,
+            )
 
-        query_optional(ser, "UPG_STATUS", STATUS_RE, args.ack_timeout)
+        query_optional(
+            ser,
+            "UPG_STATUS",
+            STATUS_RE,
+            args.ack_timeout,
+            retries=args.query_retries,
+            char_delay_ms=ctrl_delay_ms,
+            preflush_newlines=args.preflush_newlines,
+        )
         print("[OK] UART upgrade flow completed.")
         return 0
     except Exception as exc:
         print(f"[ERR] {exc}")
         if args.abort_on_fail:
             try:
-                send_cmd(ser, "UPG_ABORT")
+                send_cmd(
+                    ser,
+                    "UPG_ABORT",
+                    char_delay_ms=ctrl_delay_ms,
+                    preflush_newlines=args.preflush_newlines,
+                )
                 expect_ack(
                     ser,
                     re.compile(r"^UPG_ACK ABORT$"),
@@ -270,6 +417,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--read-timeout", type=float, default=0.2, help="serial read timeout seconds")
     p.add_argument("--ack-timeout", type=float, default=2.0, help="ACK wait timeout seconds")
     p.add_argument("--chunk-delay-ms", type=int, default=0, help="inter-chunk delay in ms")
+    p.add_argument(
+        "--query-retries",
+        type=int,
+        default=3,
+        help="retry times for optional query commands (GET_*/UPG_STATUS)",
+    )
+    p.add_argument(
+        "--set-period-ms",
+        type=int,
+        default=None,
+        help="optional SET_PERIOD value before upgrade (e.g. 5000)",
+    )
+    p.add_argument(
+        "--char-delay-ms",
+        type=int,
+        default=0,
+        help="send each command byte with delay to improve reliability on noisy links",
+    )
+    p.add_argument(
+        "--ctrl-char-delay-ms",
+        type=int,
+        default=-1,
+        help="override control-command byte delay (ms), -1 means use --char-delay-ms",
+    )
+    p.add_argument(
+        "--data-char-delay-ms",
+        type=int,
+        default=-1,
+        help="override UPG_DATA byte delay (ms), -1 means use --char-delay-ms",
+    )
+    p.add_argument(
+        "--preflush-newlines",
+        type=int,
+        default=0,
+        help="prepend N newlines before each command to clear stale parser state",
+    )
     p.add_argument("--activate", action="store_true", help="send UPG_ACTIVATE after UPG_END")
     p.add_argument("--confirm", action="store_true", help="send UPG_CONFIRM after activate")
     p.add_argument("--abort-on-fail", action="store_true", help="send UPG_ABORT when transfer fails")

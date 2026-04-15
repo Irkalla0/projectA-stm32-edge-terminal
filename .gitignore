@@ -5,6 +5,8 @@ __pycache__/
 # STM32CubeIDE build outputs
 projectA_day1_sht30_mx/Debug/
 projectA_day1_sht30_mx/Release/
+bootloader_f407/Debug/
+bootloader_f407/Release/
 
 # Optional generated artifacts
 *.elf
@@ -19,6 +21,7 @@ thread_backup_*.zip
 thread_backup_*/
 chat_export_*.md
 thread_backup_automation_prompt.md
+logs/upgrade/
 
 # OS junk
 Thumbs.db
