@@ -51,8 +51,8 @@ def render_markdown(results: Dict[str, dict]) -> str:
     total = len(DEFAULT_CASES)
     for c in DEFAULT_CASES:
         r = results.get(c["id"], {})
-        result = str(r.get("result", "TODO"))
-        evidence = str(r.get("evidence", "待补充日志/截图/命令输出"))
+        result = str(r.get("result", "NOT_RECORDED"))
+        evidence = str(r.get("evidence", "N/A"))
         if result.upper() in ("PASS", "OK", "通过"):
             pass_cnt += 1
         lines.append(f"| {c['id']} | {c['name']} | {c['target']} | {result} | {evidence} |")

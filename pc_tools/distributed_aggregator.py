@@ -160,6 +160,7 @@ class Aggregator:
         self.evt_fp, self.evt_writer = _ensure_csv(Path(args.out_events).resolve(), EVENT_HEADERS)
         self.db = _ensure_db(Path(args.out_db).resolve())
         self.tracker = NodeTracker()
+        self.online_state: Dict[str, bool] = {}
         self.serial_processed_rows = 0
         self.mqtt_client = None
 
@@ -343,6 +344,32 @@ class Aggregator:
             self.ingest_serial_tail()
             if now >= next_stat:
                 snap = self.tracker.snapshot(now, self.args.node_timeout_s)
+                for node_id, st in snap.items():
+                    is_online = bool(st["online"])
+                    prev_online = self.online_state.get(node_id)
+                    if prev_online is None:
+                        self.online_state[node_id] = is_online
+                        continue
+                    if prev_online != is_online:
+                        self.online_state[node_id] = is_online
+                        self.write_event(
+                            {
+                                "event_id": f"evt_node_{uuid.uuid4().hex[:12]}",
+                                "ts": now,
+                                "node_id": node_id,
+                                "level": "P2" if not is_online else "P3",
+                                "anomaly_type": "node_offline" if not is_online else "node_recovered",
+                                "score": 1.0 if not is_online else 0.0,
+                                "threshold": self.args.node_timeout_s,
+                                "detail": {
+                                    "idle_s": st["idle_s"],
+                                    "count": st["count"],
+                                    "online": is_online,
+                                },
+                                "ack": 0,
+                                "source": "aggregator",
+                            }
+                        )
                 online = [k for k, v in snap.items() if v["online"]]
                 offline = [k for k, v in snap.items() if not v["online"]]
                 print(

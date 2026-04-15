@@ -32,6 +32,8 @@
 /* USER CODE BEGIN PTD */
 #define SHT30_ADDR_44 (0x44 << 1)
 #define SHT30_ADDR_45 (0x45 << 1)
+#define VL53L0X_ADDR (0x29 << 1)
+#define INA219_ADDR (0x40 << 1)
 #define I2C_IO_TIMEOUT_MS 50U
 
 typedef enum
@@ -97,6 +99,13 @@ typedef struct
 #define W25_BOOT_META_ADDR 0x00FF0000UL
 #define W25_BOOT_META_MAGIC 0x42535445UL /* "BSTE" */
 #define W25_BOOT_META_VERSION 0x00000001UL
+#define CAN_HOST_TO_DEV_STDID 0x321U
+#define CAN_DEV_TO_HOST_STDID 0x322U
+#define CAN_PKT_SEG 0x01U
+#define CAN_PKT_EOM 0x02U
+#define CAN_PKT_ACK 0xA0U
+#define CAN_PKT_NACK 0xA1U
+#define CAN_MAX_SEG_BYTES 5U
 
 /* USER CODE END PD */
 
@@ -109,6 +118,7 @@ typedef struct
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 SPI_HandleTypeDef hspi1;
+CAN_HandleTypeDef hcan1;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -141,6 +151,10 @@ static uint16_t g_sensor_addr = 0;
 static sensor_type_t g_sensor_type = SENSOR_NONE;
 static I2C_HandleTypeDef *g_sensor_i2c = NULL;
 static const char *g_sensor_bus = "none";
+static I2C_HandleTypeDef *g_vl53_i2c = NULL;
+static I2C_HandleTypeDef *g_ina219_i2c = NULL;
+static uint8_t g_vl53_ok = 0U;
+static uint8_t g_ina219_ok = 0U;
 static uint8_t g_sim_mode = 0;
 static float g_sim_t = 25.0f;
 static float g_sim_h = 50.0f;
@@ -157,8 +171,15 @@ typedef struct
   char buf[UPG_CMD_BUF_SIZE];
   uint16_t len;
 } cmd_rx_ctx_t;
+typedef struct
+{
+  char buf[UPG_CMD_BUF_SIZE];
+  uint16_t len;
+  uint8_t seq;
+} can_rx_ctx_t;
 static cmd_rx_ctx_t g_cmd_rx_uart1 = {{0}, 0};
 static cmd_rx_ctx_t g_cmd_rx_uart2 = {{0}, 0};
+static can_rx_ctx_t g_cmd_rx_can = {{0}, 0, 0};
 static uint32_t g_last_sample_tick = 0;
 static upgrade_state_t g_upg_state = UPG_STATE_IDLE;
 static uint32_t g_upg_expected_size = 0;
@@ -189,6 +210,7 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
@@ -198,12 +220,16 @@ static void I2C_PrintScan(I2C_HandleTypeDef *hi2c, const char *bus_name);
 static void I2C_PrintScanAll(void);
 static void Sensor_Detect(void);
 static HAL_StatusTypeDef Sensor_Read(float *temp_c, float *hum_rh);
+static HAL_StatusTypeDef VL53L0X_ReadDistanceMm(uint16_t *dist_mm);
+static HAL_StatusTypeDef INA219_ReadCurrentMa(uint16_t *curr_ma);
 static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len);
 static uint32_t CRC32_UpdateRaw(uint32_t crc, const uint8_t *data, uint16_t len);
 static void Protocol_PrintFrameHex(uint8_t cmd, int16_t temp_centi, uint16_t hum_centi);
 static void Protocol_ProcessCommand(const char *cmd);
 static void Protocol_HandleRxByte(cmd_rx_ctx_t *ctx, uint8_t ch);
+static void Protocol_HandleCanFrame(const CAN_RxHeaderTypeDef *hdr, const uint8_t *data);
 static void Protocol_PollRx(void);
+static void CAN_SendPacket(uint8_t type, uint8_t seq, uint8_t code);
 static void App_TaskStep(void);
 static int ParseU32Token(const char *text, uint32_t *out);
 static int ParseHexBytes(const char *hex, uint8_t *out, uint16_t max_len, uint16_t *out_len);
@@ -1210,13 +1236,109 @@ static void Protocol_HandleRxByte(cmd_rx_ctx_t *ctx, uint8_t ch)
   }
 }
 
+static void CAN_SendPacket(uint8_t type, uint8_t seq, uint8_t code)
+{
+  CAN_TxHeaderTypeDef tx = {0};
+  uint8_t payload[8] = {0};
+  uint32_t mailbox = 0;
+
+  tx.StdId = CAN_DEV_TO_HOST_STDID;
+  tx.ExtId = 0;
+  tx.IDE = CAN_ID_STD;
+  tx.RTR = CAN_RTR_DATA;
+  tx.DLC = 3;
+  tx.TransmitGlobalTime = DISABLE;
+
+  payload[0] = type;
+  payload[1] = seq;
+  payload[2] = code;
+  if (HAL_CAN_AddTxMessage(&hcan1, &tx, payload, &mailbox) != HAL_OK)
+  {
+    /* UART log still helps when CAN TX is busy. */
+    printf("CAN_TX_ERR:type=%u,seq=%u\r\n", (unsigned int)type, (unsigned int)seq);
+  }
+}
+
+static void Protocol_HandleCanFrame(const CAN_RxHeaderTypeDef *hdr, const uint8_t *data)
+{
+  uint8_t pkt_type = 0U;
+  uint8_t seq = 0U;
+  uint8_t seg_len = 0U;
+  uint8_t frag_idx = 0U;
+
+  if (hdr == NULL || data == NULL)
+    return;
+  if (hdr->IDE != CAN_ID_STD || hdr->StdId != CAN_HOST_TO_DEV_STDID || hdr->RTR != CAN_RTR_DATA)
+    return;
+  if (hdr->DLC < 2U)
+    return;
+
+  pkt_type = data[0];
+  seq = data[1];
+  if (pkt_type == CAN_PKT_SEG)
+  {
+    if (hdr->DLC < 4U)
+    {
+      CAN_SendPacket(CAN_PKT_NACK, seq, 1U);
+      return;
+    }
+    seg_len = data[2];
+    frag_idx = data[3];
+    if (seg_len > CAN_MAX_SEG_BYTES || (4U + seg_len) > hdr->DLC)
+    {
+      CAN_SendPacket(CAN_PKT_NACK, seq, 2U);
+      g_cmd_rx_can.len = 0U;
+      return;
+    }
+
+    if (frag_idx == 0U)
+    {
+      g_cmd_rx_can.len = 0U;
+      g_cmd_rx_can.seq = seq;
+    }
+
+    if ((g_cmd_rx_can.len + seg_len) >= (UPG_CMD_BUF_SIZE - 1U))
+    {
+      g_cmd_rx_can.len = 0U;
+      CAN_SendPacket(CAN_PKT_NACK, seq, 3U);
+      return;
+    }
+
+    memcpy(&g_cmd_rx_can.buf[g_cmd_rx_can.len], &data[4], seg_len);
+    g_cmd_rx_can.len += seg_len;
+    return;
+  }
+
+  if (pkt_type == CAN_PKT_EOM)
+  {
+    if (g_cmd_rx_can.len == 0U)
+    {
+      CAN_SendPacket(CAN_PKT_NACK, seq, 4U);
+      return;
+    }
+    g_cmd_rx_can.buf[g_cmd_rx_can.len] = '\0';
+    Protocol_ProcessCommand(g_cmd_rx_can.buf);
+    g_cmd_rx_can.len = 0U;
+    CAN_SendPacket(CAN_PKT_ACK, seq, 0U);
+    return;
+  }
+}
+
 static void Protocol_PollRx(void)
 {
   uint8_t ch = 0;
+  CAN_RxHeaderTypeDef rx_header = {0};
+  uint8_t rx_data[8] = {0};
   while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
     Protocol_HandleRxByte(&g_cmd_rx_uart1, ch);
   while (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK)
     Protocol_HandleRxByte(&g_cmd_rx_uart2, ch);
+
+  while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0U)
+  {
+    if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
+      Protocol_HandleCanFrame(&rx_header, rx_data);
+  }
 }
 
 static void App_TaskStep(void)
@@ -1267,9 +1389,16 @@ static void App_TaskStep(void)
     Protocol_PrintFrameHex(0xA1, (int16_t)(t * 100.0f), (uint16_t)(h * 100.0f));
   }
 
-  g_sim_dist_mm = (g_sim_dist_mm > 120) ? (uint16_t)(g_sim_dist_mm - 35) : 1300;
-  g_sim_curr_ma = (g_sim_curr_ma < 1700) ? (uint16_t)(g_sim_curr_ma + 22) : 320;
-  printf("SIM2 DIST=%umm CUR=%umA\r\n", g_sim_dist_mm, g_sim_curr_ma);
+  if (VL53L0X_ReadDistanceMm(&g_sim_dist_mm) == HAL_OK && INA219_ReadCurrentMa(&g_sim_curr_ma) == HAL_OK)
+  {
+    printf("REAL2 DIST=%umm CUR=%umA\r\n", g_sim_dist_mm, g_sim_curr_ma);
+  }
+  else
+  {
+    g_sim_dist_mm = (g_sim_dist_mm > 120) ? (uint16_t)(g_sim_dist_mm - 35) : 1300;
+    g_sim_curr_ma = (g_sim_curr_ma < 1700) ? (uint16_t)(g_sim_curr_ma + 22) : 320;
+    printf("SIM2 DIST=%umm CUR=%umA\r\n", g_sim_dist_mm, g_sim_curr_ma);
+  }
   Protocol_PrintFrameHex(0x02, (int16_t)g_sim_dist_mm, g_sim_curr_ma);
 
   if (g_sim_dist_mm <= g_dist_alarm_th_mm || g_sim_curr_ma >= g_curr_alarm_th_ma)
@@ -1313,6 +1442,10 @@ static void Sensor_Detect(void)
   g_sensor_type = SENSOR_NONE;
   g_sensor_i2c = NULL;
   g_sensor_bus = "none";
+  g_vl53_i2c = NULL;
+  g_ina219_i2c = NULL;
+  g_vl53_ok = 0U;
+  g_ina219_ok = 0U;
 
   typedef struct
   {
@@ -1336,7 +1469,7 @@ static void Sensor_Detect(void)
       g_sensor_type = SENSOR_SHT3X;
       g_sensor_i2c = hi2c;
       g_sensor_bus = name;
-      return;
+      break;
     }
 
     if (HAL_I2C_IsDeviceReady(hi2c, SHT30_ADDR_45, 2, 30) == HAL_OK)
@@ -1345,8 +1478,23 @@ static void Sensor_Detect(void)
       g_sensor_type = SENSOR_SHT3X;
       g_sensor_i2c = hi2c;
       g_sensor_bus = name;
-      return;
+      break;
     }
+  }
+
+  /* Distance + current channels default on I2C2 (PB10/PB11). */
+  if (HAL_I2C_IsDeviceReady(&hi2c2, VL53L0X_ADDR, 2, 30) == HAL_OK)
+  {
+    g_vl53_i2c = &hi2c2;
+    g_vl53_ok = 1U;
+  }
+  if (HAL_I2C_IsDeviceReady(&hi2c2, INA219_ADDR, 2, 30) == HAL_OK)
+  {
+    uint8_t cal_reg = 0x05;
+    uint8_t cal_val[2] = {0x10, 0x00};
+    g_ina219_i2c = &hi2c2;
+    g_ina219_ok = 1U;
+    (void)HAL_I2C_Mem_Write(g_ina219_i2c, INA219_ADDR, cal_reg, I2C_MEMADD_SIZE_8BIT, cal_val, 2, I2C_IO_TIMEOUT_MS);
   }
 }
 
@@ -1380,6 +1528,69 @@ static HAL_StatusTypeDef Sensor_Read(float *temp_c, float *hum_rh)
   }
 
   return HAL_ERROR;
+}
+
+static HAL_StatusTypeDef VL53L0X_ReadDistanceMm(uint16_t *dist_mm)
+{
+  uint8_t reg = 0;
+  uint8_t status = 0;
+  uint8_t out[2] = {0};
+  uint8_t start_cmd = 0x01;
+  uint8_t clr[2] = {0x0B, 0x01};
+
+  if (dist_mm == NULL || g_vl53_i2c == NULL || g_vl53_ok == 0U)
+    return HAL_ERROR;
+
+  /* Start a single ranging cycle. */
+  reg = 0x00;
+  if (HAL_I2C_Mem_Write(g_vl53_i2c, VL53L0X_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &start_cmd, 1, I2C_IO_TIMEOUT_MS) != HAL_OK)
+    return HAL_ERROR;
+
+  for (uint8_t i = 0; i < 20U; i++)
+  {
+    reg = 0x13;
+    if (HAL_I2C_Mem_Read(g_vl53_i2c, VL53L0X_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &status, 1, I2C_IO_TIMEOUT_MS) != HAL_OK)
+      return HAL_ERROR;
+    if ((status & 0x07U) != 0U)
+      break;
+    HAL_Delay(2);
+  }
+
+  reg = 0x1E;
+  if (HAL_I2C_Mem_Read(g_vl53_i2c, VL53L0X_ADDR, reg, I2C_MEMADD_SIZE_8BIT, out, 2, I2C_IO_TIMEOUT_MS) != HAL_OK)
+    return HAL_ERROR;
+
+  *dist_mm = ((uint16_t)out[0] << 8) | out[1];
+  if (*dist_mm == 0U || *dist_mm > 4000U)
+    return HAL_ERROR;
+
+  /* Clear interrupt status. */
+  if (HAL_I2C_Master_Transmit(g_vl53_i2c, VL53L0X_ADDR, clr, 2, I2C_IO_TIMEOUT_MS) != HAL_OK)
+    return HAL_ERROR;
+  return HAL_OK;
+}
+
+static HAL_StatusTypeDef INA219_ReadCurrentMa(uint16_t *curr_ma)
+{
+  uint8_t reg = 0x04;
+  uint8_t raw[2] = {0};
+  int16_t current_raw = 0;
+
+  if (curr_ma == NULL || g_ina219_i2c == NULL || g_ina219_ok == 0U)
+    return HAL_ERROR;
+
+  if (HAL_I2C_Mem_Read(g_ina219_i2c, INA219_ADDR, reg, I2C_MEMADD_SIZE_8BIT, raw, 2, I2C_IO_TIMEOUT_MS) != HAL_OK)
+    return HAL_ERROR;
+
+  current_raw = (int16_t)(((uint16_t)raw[0] << 8) | raw[1]);
+  if (current_raw < 0)
+    current_raw = (int16_t)(-current_raw);
+
+  /* Conservative conversion for the default calibration profile. */
+  *curr_ma = (uint16_t)((uint16_t)current_raw / 10U);
+  if (*curr_ma > 6000U)
+    return HAL_ERROR;
+  return HAL_OK;
 }
 
 /* USER CODE END 0 */
@@ -1416,10 +1627,15 @@ int main(void)
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_SPI1_Init();
+  MX_CAN1_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   printf("BOOT_V3_DUAL_I2C_SCAN\r\n");
+  if (HAL_CAN_Start(&hcan1) == HAL_OK)
+    printf("CAN_READY:id_rx=0x%03X,id_tx=0x%03X\r\n", CAN_HOST_TO_DEV_STDID, CAN_DEV_TO_HOST_STDID);
+  else
+    printf("CAN_NOT_READY (check PA11/PA12 + transceiver)\r\n");
   if (W25_Init() == HAL_OK)
   {
     printf("W25_READY:id=0x%06lX%s\r\n",
@@ -1443,6 +1659,14 @@ int main(void)
     printf("SHT3X NOT FOUND (need addr 0x44/0x45; check PB6/PB7 or PB10/PB11, plus VCC/GND)\r\n");
     printf("SIM_MODE=ON (using virtual temp/humidity)\r\n");
   }
+  if (g_vl53_ok)
+    printf("VL53L0X DETECTED: 0x29 on I2C2(PB10/PB11)\r\n");
+  else
+    printf("VL53L0X NOT FOUND on I2C2(PB10/PB11), DIST channel uses fallback profile\r\n");
+  if (g_ina219_ok)
+    printf("INA219 DETECTED: 0x40 on I2C2(PB10/PB11)\r\n");
+  else
+    printf("INA219 NOT FOUND on I2C2(PB10/PB11), CUR channel uses fallback profile\r\n");
   printf("CMD: GET_PERIOD / SET_PERIOD <100-5000>\r\n");
   printf("CMD: GET_THR / SET_THR_T <0-80> / SET_THR_H <0-100>\r\n");
   printf("CMD: GET_THR2 / SET_THR_D <50-4000> / SET_THR_I <100-5000>\r\n");
@@ -1450,6 +1674,7 @@ int main(void)
   printf("CMD: UPG_BEGIN <ver> <size> <crc32> / UPG_DATA <off> <hex> <crc32>\r\n");
   printf("CMD: UPG_END / UPG_ACTIVATE / UPG_CONFIRM / UPG_FAIL_ONCE\r\n");
   printf("CMD: FLASH_ID(GET_FLASH) / BOOT_SAVE / BOOT_LOAD\r\n");
+  printf("CAN_TUNNEL: id_rx=0x%03X id_tx=0x%03X pkt=SEG/EOM/ACK/NACK\r\n", CAN_HOST_TO_DEV_STDID, CAN_DEV_TO_HOST_STDID);
   Upg_ResetSession();
   Boot_PrintState();
   g_last_sample_tick = HAL_GetTick();
@@ -1664,6 +1889,49 @@ static void MX_SPI1_Init(void)
 
   /* USER CODE END SPI1_Init 2 */
 
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+  CAN_FilterTypeDef filter = {0};
+
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 6;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_13TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = ENABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Accept all IDs in FIFO0 and filter by StdId in software. */
+  filter.FilterBank = 0;
+  filter.FilterMode = CAN_FILTERMODE_IDMASK;
+  filter.FilterScale = CAN_FILTERSCALE_32BIT;
+  filter.FilterIdHigh = 0x0000;
+  filter.FilterIdLow = 0x0000;
+  filter.FilterMaskIdHigh = 0x0000;
+  filter.FilterMaskIdLow = 0x0000;
+  filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  filter.FilterActivation = ENABLE;
+  filter.SlaveStartFilterBank = 14;
+  if (HAL_CAN_ConfigFilter(&hcan1, &filter) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**

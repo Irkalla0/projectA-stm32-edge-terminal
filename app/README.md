@@ -1,14 +1,18 @@
-# App Workspace (V2)
+﻿# Application Workspace (Final)
 
-Current application firmware remains in:
+Application firmware project: `projectA_day1_sht30_mx/`
 
-- `projectA_day1_sht30_mx/`
+## Responsibilities
 
-This folder is prepared for a cleaner V2 split where bootloader and app have
-independent build outputs and release artifacts.
+- multi-sensor acquisition and threshold alarms
+- custom frame protocol (`0xAA55 + payload + CRC16`)
+- dual-UART command interaction and fault tolerance
+- runtime handshake with boot state and upgrade status
+- CAN command tunnel endpoint for parallel upgrade channel
 
-Recommended artifacts:
+## Key commands
 
-- `app.bin`
-- `app_with_header.bin`
-- `upgrade_package.bin`
+- acquisition: `GET_PERIOD`, `SET_PERIOD`, `GET_THR`, `SET_THR_*`, `GET_THR2`, `SET_THR_*`
+- upgrade/runtime: `GET_VER`, `GET_CAP`, `GET_FLASH`, `GET_BOOTSTATE`, `UPG_*`
+
+Bootloader ownership remains in `bootloader_f407/` and `bootloader/` shared protocol core.

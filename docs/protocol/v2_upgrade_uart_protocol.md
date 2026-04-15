@@ -131,3 +131,8 @@ Use `tools/pack_fw.py` to generate package with a fixed 64-byte header:
 - Keep max chunk small first (64/128 bytes) for robust UART recovery.
 - Current firmware implementation validates `UPG_*` state and CRC in RAM for integration testing.
 - Flash write/swap/rollback is reserved for the next step (`bootloader/` + app jump flow).
+
+## Parallel Transport Note
+
+UART command semantics are reused by CAN tunnel transport in docs/protocol/v2_upgrade_can_tunnel.md. In parallel mode, host tools prefer CAN and fallback to UART when CAN retries exceed threshold.
+

@@ -4,6 +4,8 @@ import json
 import os
 import re
 import struct
+import subprocess
+import sys
 import time
 from collections import deque
 
@@ -267,6 +269,11 @@ def main():
     parser.add_argument("--points", type=int, default=180, help="plot points, default 180")
     parser.add_argument("--csv", default="", help="optional csv output path")
     parser.add_argument(
+        "--upgrade-pkg",
+        default="D:/codex/project A/build/v2/upgrade_package.bin",
+        help="default firmware package path for UI upgrade actions",
+    )
+    parser.add_argument(
         "--set-period",
         type=int,
         default=None,
@@ -300,7 +307,7 @@ def main():
 
     plt.ion()
     fig, ax = plt.subplots()
-    fig.subplots_adjust(bottom=0.32)
+    fig.subplots_adjust(bottom=0.44)
     line_t, = ax.plot([], [], label="温度(°C)")
     line_h, = ax.plot([], [], label="湿度(%)")
     ax.set_title("项目A 串口波形")
@@ -384,6 +391,9 @@ def main():
     ax_b7 = fig.add_axes([0.82, 0.20, 0.14, 0.055])
     ax_tb = fig.add_axes([0.06, 0.11, 0.70, 0.055])
     ax_bs = fig.add_axes([0.78, 0.11, 0.16, 0.055])
+    ax_pkg = fig.add_axes([0.06, 0.02, 0.54, 0.055])
+    ax_up_uart = fig.add_axes([0.62, 0.02, 0.16, 0.055])
+    ax_up_parallel = fig.add_axes([0.80, 0.02, 0.16, 0.055])
 
     btn_get_period = Button(ax_b1, "读周期")
     btn_set_500 = Button(ax_b2, "周期500ms")
@@ -394,6 +404,9 @@ def main():
     btn_save_cfg = Button(ax_b7, "保存配置")
     tb_cmd = TextBox(ax_tb, "命令", initial="GET_PERIOD")
     btn_send = Button(ax_bs, "发送")
+    tb_pkg = TextBox(ax_pkg, "升级包", initial=args.upgrade_pkg)
+    btn_up_uart = Button(ax_up_uart, "升级UART")
+    btn_up_parallel = Button(ax_up_parallel, "升级并行")
 
     def on_get_period(_):
         send_cmd("GET_PERIOD")
@@ -423,6 +436,46 @@ def main():
     def on_send(_):
         send_cmd(tb_cmd.text)
 
+    def run_upgrade(transport: str):
+        pkg = tb_pkg.text.strip()
+        if not pkg:
+            print("[WARN] 升级包路径为空")
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upgrade_client.py")
+        port = current_port if current_port else args.port
+        cmd = [
+            sys.executable,
+            script,
+            "--pkg",
+            pkg,
+            "--transport",
+            transport,
+            "--port",
+            port,
+            "--baud",
+            str(args.baud),
+            "--activate",
+            "--confirm",
+            "--abort-on-fail",
+        ]
+        print("[INFO] Launch upgrader:", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd, check=False)
+            if result.returncode == 0:
+                print(f"[INFO] 升级完成 transport={transport}")
+                send_cmd("GET_BOOTSTATE")
+                send_cmd("UPG_STATUS")
+            else:
+                print(f"[WARN] 升级失败 transport={transport} rc={result.returncode}")
+        except Exception as e:
+            print(f"[WARN] 升级执行异常: {e}")
+
+    def on_up_uart(_):
+        run_upgrade("uart")
+
+    def on_up_parallel(_):
+        run_upgrade("parallel")
+
     btn_get_period.on_clicked(on_get_period)
     btn_set_500.on_clicked(on_set_500)
     btn_get_thr.on_clicked(on_get_thr)
@@ -431,6 +484,8 @@ def main():
     btn_preset_a2.on_clicked(on_preset_a2)
     btn_save_cfg.on_clicked(on_save_cfg)
     btn_send.on_clicked(on_send)
+    btn_up_uart.on_clicked(on_up_uart)
+    btn_up_parallel.on_clicked(on_up_parallel)
     tb_cmd.on_submit(lambda text: send_cmd(text))
 
     if args.csv:
