@@ -80,7 +80,8 @@ if (-not $token) {
   Write-Host "Missing GH_TOKEN/GITHUB_TOKEN. Set one token and rerun." -ForegroundColor Red
   Write-Host "Example:" -ForegroundColor Yellow
   Write-Host "  `$env:GITHUB_TOKEN='YOUR_PAT'" -ForegroundColor Yellow
-  Write-Host "  powershell -ExecutionPolicy Bypass -File \"$PSCommandPath\"" -ForegroundColor Yellow
+  $quotedPath = '"' + $PSCommandPath + '"'
+  Write-Host "  powershell -ExecutionPolicy Bypass -File $quotedPath" -ForegroundColor Yellow
   exit 2
 }
 
