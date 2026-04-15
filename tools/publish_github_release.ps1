@@ -1,15 +1,23 @@
 ﻿param(
-  [string]$RepoRoot = "D:\codex\project A",
+  [string]$RepoRoot,
   [string]$Tag = "v2.0.0-final",
   [string]$TargetCommitish = "main",
   [string]$ReleaseName = "Project A v2.0.0-final",
-  [string]$BodyFile = "D:\codex\project A\docs\projectA_release_note_v2.0.0-final.md",
+  [string]$BodyFile,
   [switch]$Draft,
   [switch]$Prerelease,
   [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $RepoRoot) {
+  $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+
+if (-not $BodyFile) {
+  $BodyFile = Join-Path $RepoRoot "docs\projectA_release_note_v2.0.0-final.md"
+}
 
 function Resolve-RepoInfo {
   param([string]$Root)
